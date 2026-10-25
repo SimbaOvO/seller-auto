@@ -33,6 +33,8 @@ from seller_auto.mercadolibre import (
     sales_from_text,
 )
 from seller_auto.pacing import DelaySettings
+from seller_auto.sales import sales_action
+from seller_auto.progress import next_required_step
 from seller_auto.storage import (
     atomic_write_json,
     build_export,
@@ -40,11 +42,14 @@ from seller_auto.storage import (
     find_state_by_session,
     load_json,
     seller_dir,
+    similarity_rows,
     state_path,
+    public_url,
 )
-from seller_auto.urls import UrlError, clean_keywords, ml_search_url, parse_seller_id
+from seller_auto.step_log import step
+from seller_auto.urls import UrlError, clean_keywords, ml_search_url, parse_focus_product, resolve_store_input
 
-BATCH_SIZE = 8
+BATCH_SIZE = 24
 
 
 @dataclass
@@ -79,6 +84,17 @@ class _Worker:
         return value
 
 
+def _storage_id(state: dict[str, Any]) -> str:
+    parts = [state["seller_id"]]
+    run_id = state.get("run_id") or ""
+    focus = state.get("single_product") or ""
+    if run_id:
+        parts.append(run_id)
+    if focus:
+        parts.append(f"focus-{focus}")
+    return "/".join(parts)
+
+
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -98,6 +114,8 @@ def _new_state(session_id: str, seller_id: str, store_url: str) -> dict[str, Any
         "list_url": store_url,
         "amazon_page": 1,
         "amazon_done": False,
+        "single_product": "",
+        "run_id": "",
         "visited": [],
         "excluded": [],
         "products": {},
@@ -125,8 +143,8 @@ class SellerAutoService:
         self.state: dict[str, Any] | None = None
         self._worker = worker or _Worker()
 
-    def open_store(self, url: str) -> ToolPayload:
-        return self._guard(self._open_store, url)
+    def open_store(self, seller_id: str, product: str = "") -> ToolPayload:
+        return self._guard(self._open_store, seller_id, product)
 
     def next_amazon_product(self) -> ToolPayload:
         return self._guard(self._next_amazon_product)
@@ -163,6 +181,7 @@ class SellerAutoService:
             message = str(exc)
             if "Executable doesn't exist" in message or "browserType.launch" in message:
                 message = f"{message}。请先在项目目录执行 .venv/bin/python -m playwright install chromium"
+            step("错误", message)
             return ToolPayload({"ok": False, "status": "error", "message": message})
 
     def _invoke(self, function: Callable[..., ToolPayload], *args: Any) -> ToolPayload:
@@ -191,7 +210,7 @@ class SellerAutoService:
             state["challenge_pending"] = self.browser.challenge_pending
             state["challenge_site"] = self.browser.challenge_site
         state["updated_at"] = _now()
-        atomic_write_json(state_path(self.output_dir, state["seller_id"]), state)
+        atomic_write_json(state_path(self.output_dir, _storage_id(state)), state)
 
     def _apply_challenge_flag(self) -> None:
         browser = self._ensure_browser()
@@ -217,6 +236,7 @@ class SellerAutoService:
             "kept": len(state["product_order"]),
             "current_product_id": current,
             "listing_remaining": remaining,
+            "next_step": next_required_step(state),
         }
 
     def _payload(self, data: dict[str, Any], images: list[tuple[str, str]] | None = None) -> ToolPayload:
@@ -227,38 +247,51 @@ class SellerAutoService:
             jpeg = _jpeg_file(path)
             if jpeg is not None:
                 encoded.append((caption, jpeg))
+        status = data.get("status") or ""
+        if status:
+            step(str(status), str(data.get("message") or ""))
         return ToolPayload(data, encoded)
 
     def _blocked(self, blocked: dict[str, Any]) -> ToolPayload:
         self._save()
         return self._payload(blocked)
 
-    def _open_store(self, url: str) -> ToolPayload:
-        seller_id = parse_seller_id(url)
+    def _open_store(self, seller_id: str, product: str = "") -> ToolPayload:
+        seller_id, store_url = resolve_store_input(seller_id)
+        focus = parse_focus_product(product)
         browser = self._ensure_browser()
-        path = state_path(self.output_dir, seller_id)
-        resumed = path.exists()
-        if resumed:
-            self.state = load_json(path)
-        else:
-            self.state = _new_state(str(uuid.uuid4()), seller_id, url)
+        session_id = str(uuid.uuid4())
+        self.state = _new_state(session_id, seller_id, store_url)
+        self.state["single_product"] = focus
+        self.state["run_id"] = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + session_id[:8]
         self._apply_challenge_flag()
         browser.amazon_cooldown.acquire()
-        target = self.state.get("list_url") or url
+        if focus:
+            target = f"https://www.amazon.com.mx/dp/{focus}"
+        else:
+            target = store_url
         browser.goto(browser.list_page, target)
         blocked = browser.ensure_clear(browser.list_page, "amazon")
         if blocked:
             return self._blocked(blocked)
         browser.pause_amazon_read()
-        self.state["list_url"] = browser.list_page.url
-        self._save()
-        return self._payload(
-            {
-                "ok": True,
-                "status": "store_ready",
-                "resumed": resumed,
-                "message": "店铺已打开。请调用 next_amazon_product 读取下一条。",
-            }
+        if not focus:
+            self.state["list_url"] = browser.list_page.url
+            self._save()
+            return self._payload(
+                {
+                    "ok": True,
+                    "status": "store_ready",
+                    "resumed": False,
+                    "single_product": "",
+                    "message": "新的一轮，店铺已打开。请调用 next_amazon_product。不要恢复旧会话。",
+                }
+            )
+        return self._save_opened_amazon_product(
+            browser,
+            browser.list_page,
+            False,
+            {"index": -1, "href": target, "asin": focus, "text": "", "key": focus},
         )
 
     def _resume_session(self, session_id: str) -> ToolPayload:
@@ -266,18 +299,17 @@ class SellerAutoService:
         if path is None:
             return ToolPayload({"ok": False, "status": "error", "message": "没有找到这个会话"})
         self.state = load_json(path)
-        browser = self._ensure_browser()
+        self._ensure_browser()
         self._apply_challenge_flag()
-        target = self.state.get("list_url") or self.state["store_url"]
-        browser.amazon_cooldown.acquire()
-        browser.close_detail()
-        browser.goto(browser.list_page, target)
-        blocked = browser.ensure_clear(browser.list_page, "amazon")
-        if blocked:
-            return self._blocked(blocked)
-        browser.pause_amazon_read()
         self._save()
-        return self._payload({"ok": True, "status": "resumed", "message": "已从本地进度恢复"})
+        step_name = next_required_step(self.state)
+        return self._payload(
+            {
+                "ok": True,
+                "status": "resumed",
+                "message": f"已从本地进度恢复。请继续 {step_name}，不要重新打开店铺或重设关键词。",
+            }
+        )
 
     def _session_status(self) -> ToolPayload:
         self._require_state()
@@ -286,9 +318,15 @@ class SellerAutoService:
     def _export_results(self) -> ToolPayload:
         state = self._require_state()
         payload = build_export(state)
-        path = seller_dir(self.output_dir, state["seller_id"]) / export_filename()
+        path = seller_dir(self.output_dir, _storage_id(state)) / export_filename()
         atomic_write_json(path, payload)
-        return self._payload({"ok": True, "status": "exported", "path": str(path)})
+        if state.get("single_product"):
+            message = "这一条商品的结果已导出。不要再调用 next_amazon_product。"
+        elif state.get("amazon_done"):
+            message = "店铺列表已遍历完，结果已导出。"
+        else:
+            message = "这是部分结果。店铺还有未查看的商品，请继续 next_amazon_product，直到返回 end_of_store。"
+        return self._payload({"ok": True, "status": "exported", "path": str(path), "message": message})
 
     def _next_amazon_product(self) -> ToolPayload:
         state = self._require_state()
@@ -297,27 +335,78 @@ class SellerAutoService:
         if self.settings.max_products and len(state["product_order"]) >= self.settings.max_products:
             return self._payload({"ok": True, "status": "limit_reached", "message": "已达到 max_products"})
         browser = self._ensure_browser()
-        blocked = self._ensure_amazon_list()
-        if blocked:
-            return blocked
-        entry = self._next_unvisited_entry()
-        if entry is None:
-            if not self._turn_amazon_page():
+        focus = state.get("single_product") or ""
+        if focus:
+            if focus in state["products"]:
+                saved = state["products"][focus]
+                return self._payload(
+                    {
+                        "ok": True,
+                        "status": "amazon_product",
+                        "product_id": focus,
+                        "title": saved.get("title") or "",
+                        "brand": saved.get("brand") or "",
+                        "url": saved.get("url") or "",
+                        "message": "这个商品已经读过。请直接 set_keywords，不要再打开。",
+                    },
+                    [(f"亚马逊主图 product_id={focus}", saved.get("image_path") or "")],
+                )
+            if focus in state["visited"]:
                 state["amazon_done"] = True
                 self._save()
-                return self._payload({"ok": True, "status": "end_of_store", "message": "店铺列表已经读完"})
+                return self._payload(
+                    {
+                        "ok": True,
+                        "status": "end_of_store",
+                        "message": f"指定商品 {focus} 已结束。不要再翻店铺。",
+                    }
+                )
+            browser.close_detail()
+            url = f"https://www.amazon.com.mx/dp/{focus}"
+            current = browser.list_page.url or ""
+            if focus not in current:
+                browser.amazon_cooldown.acquire()
+                browser.goto(browser.list_page, url)
+            blocked_page = browser.ensure_clear(browser.list_page, "amazon")
+            if blocked_page:
+                return self._blocked(blocked_page)
+            browser.pause_amazon_read()
+            page = browser.list_page
+            opened_new_tab = False
+            entry = {"index": -1, "href": url, "asin": focus, "text": "", "key": focus}
+        else:
+            blocked = self._ensure_amazon_list()
+            if blocked:
+                return blocked
             entry = self._next_unvisited_entry()
             if entry is None:
-                state["amazon_done"] = True
-                self._save()
-                return self._payload({"ok": True, "status": "end_of_store", "message": "这一页没有新的商品"})
-        browser.amazon_cooldown.acquire()
-        locator = title_locator(browser.list_page, entry["index"])
-        page, opened_new_tab = browser.click_result(locator)
-        blocked_page = browser.ensure_clear(page, "amazon")
-        if blocked_page:
-            return self._blocked(blocked_page)
-        browser.pause_amazon_read()
+                if not self._turn_amazon_page():
+                    state["amazon_done"] = True
+                    self._save()
+                    return self._payload({"ok": True, "status": "end_of_store", "message": "店铺列表已经读完"})
+                entry = self._next_unvisited_entry()
+                if entry is None:
+                    state["amazon_done"] = True
+                    self._save()
+                    return self._payload({"ok": True, "status": "end_of_store", "message": "这一页没有新的商品"})
+            browser.amazon_cooldown.acquire()
+            locator = title_locator(browser.list_page, entry["index"])
+            page, opened_new_tab = browser.click_result(locator)
+            blocked_page = browser.ensure_clear(page, "amazon")
+            if blocked_page:
+                return self._blocked(blocked_page)
+            page = browser.live_page(page)
+            browser.pause_amazon_read()
+        return self._save_opened_amazon_product(browser, page, opened_new_tab, entry)
+
+    def _save_opened_amazon_product(
+        self,
+        browser: ArgentinaBrowser,
+        page: Any,
+        opened_new_tab: bool,
+        entry: dict[str, Any],
+    ) -> ToolPayload:
+        state = self._require_state()
         try:
             page.wait_for_selector("#productTitle", timeout=15000)
         except Exception:
@@ -328,7 +417,7 @@ class SellerAutoService:
                     {"ok": False, "status": "needs_human_verification", "message": NEEDS_HUMAN, "url": page.url}
                 )
             self._mark_visited(entry["key"])
-            browser.finish_detail(opened_new_tab, state["list_url"])
+            self._leave_amazon_detail(browser, opened_new_tab, state)
             self._save()
             return self._payload(
                 {
@@ -353,7 +442,12 @@ class SellerAutoService:
                     "reason": reason,
                 }
             )
-            browser.finish_detail(opened_new_tab, state["list_url"])
+            self._leave_amazon_detail(browser, opened_new_tab, state)
+            if state.get("single_product"):
+                state["amazon_done"] = True
+                message = f"已跳过{reason}类商品。这一条已结束，请 export_results，不要再翻店铺。"
+            else:
+                message = f"已跳过{reason}类商品。请继续调用 next_amazon_product。"
             self._save()
             return self._payload(
                 {
@@ -363,7 +457,7 @@ class SellerAutoService:
                     "product_id": key,
                     "title": product["title"] or entry["text"],
                     "url": product["url"] or entry["href"],
-                    "message": f"已跳过{reason}类商品。请继续调用 next_amazon_product。",
+                    "message": message,
                 }
             )
         image_path = self._download(
@@ -387,8 +481,12 @@ class SellerAutoService:
         }
         state["product_order"].append(key)
         state["current_product_id"] = key
-        browser.finish_detail(opened_new_tab, state["list_url"])
+        self._leave_amazon_detail(browser, opened_new_tab, state)
         self._save()
+        if state.get("single_product"):
+            message = "请根据主图给出西班牙语搜索关键词，然后调用 set_keywords。这是指定的一条商品，不要再调用 next_amazon_product。"
+        else:
+            message = "请根据主图给出西班牙语搜索关键词，然后调用 set_keywords。美客多流程结束后再调用 next_amazon_product。"
         return self._payload(
             {
                 "ok": True,
@@ -397,10 +495,16 @@ class SellerAutoService:
                 "title": state["products"][key]["title"],
                 "brand": product["brand"],
                 "url": state["products"][key]["url"],
-                "message": "请根据主图给出西班牙语搜索关键词，然后调用 set_keywords。颜色可以忽略，保留品名。",
+                "message": message,
             },
             [(f"亚马逊主图 product_id={key}", image_path)],
         )
+
+    def _leave_amazon_detail(self, browser: ArgentinaBrowser, opened_new_tab: bool, state: dict[str, Any]) -> None:
+        if state.get("single_product"):
+            browser.close_detail()
+            return
+        browser.finish_detail(opened_new_tab, state["list_url"])
 
     def _set_keywords(self, product_id: str, keywords: str) -> ToolPayload:
         state = self._require_state()
@@ -478,7 +582,22 @@ class SellerAutoService:
 
     def _submit_listing_matches(self, matches: list[Any], model_name: str) -> ToolPayload:
         product = self._current_product()
-        return self._open_judged_matches(product, matches, model_name, source="search", parent_url=None)
+        payload = self._open_judged_matches(product, matches, model_name, source="search", parent_url=None)
+        return self._attach_followup(payload)
+
+    def _open_ml_detail_with_retry(self, url: str) -> Any:
+        browser = self._ensure_browser()
+        last_error: Exception | None = None
+        for attempt in range(2):
+            browser.ml_cooldown.acquire()
+            try:
+                return browser.open_detail(url, timeout=60000)
+            except Exception as exc:
+                last_error = exc
+                log(f"美客多详情打开失败（第 {attempt + 1} 次）：{exc}")
+                browser.close_detail()
+        log(f"美客多详情重试后仍失败：{last_error}")
+        return None
 
     def _next_ad_batch(self, product_id: str) -> ToolPayload:
         product = self._product(product_id)
@@ -488,13 +607,21 @@ class SellerAutoService:
             if match.get("source") != "search" or match.get("ads_complete"):
                 continue
             if not match.get("ads_scraped"):
-                browser.ml_cooldown.acquire()
-                page = browser.open_detail(match["url"])
+                page = self._open_ml_detail_with_retry(public_url(match["url"]))
+                if page is None:
+                    match["ad_candidates"] = []
+                    match["ad_next_index"] = 0
+                    match["ads_scraped"] = True
+                    match["ads_complete"] = True
+                    self._save()
+                    continue
                 blocked = browser.ensure_clear(page, "ml")
                 if blocked:
                     return self._blocked(blocked)
+                page = browser.live_page(page)
                 browser.pause_ml_read()
                 cards = collect_ad_cards(page, browser.pause_ml_scroll)
+                log(f"广告位主图 {len(cards)} 张：{public_url(match['url'])}")
                 match["ad_candidates"] = self._ad_candidates(product, match, cards)
                 match["ad_next_index"] = 0
                 match["ads_scraped"] = True
@@ -523,16 +650,17 @@ class SellerAutoService:
                     "product_id": product["product_id"],
                     "parent_url": match["url"],
                     "candidates": payload_items,
-                    "message": "请把广告图和参照图对比。颜色可以不同，外形和整体构图要高度相似。然后调用 submit_ad_matches。",
+                    "message": "请把这一批广告图和参照图对比后，直接调用 submit_ad_matches。不要再调用 next_ad_batch。",
                 },
                 images,
             )
+        message = self._step_message("这个亚马逊商品的广告位已经看完。", next_required_step(self._require_state()))
         return self._payload(
             {
                 "ok": True,
                 "status": "ads_complete",
                 "product_id": product["product_id"],
-                "message": "这个亚马逊商品的广告位已经看完。可以继续 next_amazon_product，或 export_results。",
+                "message": message,
             }
         )
 
@@ -540,7 +668,8 @@ class SellerAutoService:
         product = self._current_product()
         if not matches:
             return self._payload({"ok": True, "status": "no_matches", "message": "没有提交广告判断"})
-        return self._open_judged_matches(product, matches, model_name, source="recommendation", parent_url="")
+        payload = self._open_judged_matches(product, matches, model_name, source="recommendation", parent_url="")
+        return self._attach_followup(payload)
 
     def _open_judged_matches(
         self,
@@ -555,19 +684,34 @@ class SellerAutoService:
         recorded = []
         skipped = []
         unknown = []
-        for item in dropped:
-            if item["candidate_id"] in known:
-                self._remember_judged(product, item["candidate_id"])
-            else:
-                unknown.append(item["candidate_id"])
-        for item in kept:
+        for item in kept + dropped:
             candidate = known.get(item["candidate_id"])
             if candidate is None:
                 unknown.append(item["candidate_id"])
                 continue
-            self._remember_judged(product, candidate["candidate_id"])
+            candidate["similarity"] = item["confidence"]
+            candidate["similar"] = item["similar"]
+            candidate["reason"] = item["reason"]
+            candidate["model_name"] = model_name
+            self._remember_judged(product, item["candidate_id"])
+        quiet_skips = 0
+        for item in kept:
+            candidate = known.get(item["candidate_id"])
+            if candidate is None:
+                continue
             if candidate["key"] in product["checked_keys"]:
                 skipped.append(candidate["candidate_id"])
+                continue
+            action = sales_action(source, candidate["sales_text"] if "sales_text" in candidate else None)
+            if action == "skip":
+                product["checked_keys"].append(candidate["key"])
+                skipped.append(candidate["candidate_id"])
+                quiet_skips += 1
+                continue
+            if action == "record":
+                self._remember_sale(product, candidate, item, source, parent_url, model_name, candidate.get("sales_text") or "")
+                recorded.append(product["matches"][-1])
+                step("销量", f"卡片上已有销量，不打开详情 {candidate.get('sales_text') or ''} {public_url(candidate['url'])}")
                 continue
             browser = self._ensure_browser()
             browser.ml_cooldown.acquire()
@@ -576,21 +720,64 @@ class SellerAutoService:
             if blocked:
                 self._save()
                 return self._blocked(blocked)
+            page = browser.live_page(page)
             browser.pause_ml_read()
             sales = sales_from_text(read_sales_text(page))
             product["checked_keys"].append(candidate["key"])
             if not sales["has_sales"]:
+                step("销量", f"没有 vendido，不记录 {public_url(candidate['url'])}")
                 browser.close_detail()
                 self._save()
                 skipped.append(candidate["candidate_id"])
                 continue
             image_path = self._download(hero_image_url(page), self._image_stem(candidate["key"]), hero_locator(page), page.url)
-            parent = candidate.get("parent_url") if source == "recommendation" else parent_url
-            match = {
+            self._remember_sale(
+                product, candidate, item, source, parent_url, model_name, sales["sales_text"], image_path
+            )
+            recorded.append(product["matches"][-1])
+            step("销量", f"有销量，已记录 {sales['sales_text']} {public_url(candidate['url'])}")
+            browser.close_detail()
+            self._save()
+        if quiet_skips:
+            step("销量", f"卡片上没有 vendido，跳过 {quiet_skips} 条，没有打开详情")
+        self._save()
+        return self._payload(
+            {
+                "ok": True,
+                "status": "matches_recorded" if recorded else "no_sales_or_not_similar",
+                "product_id": product["product_id"],
+                "source": source,
+                "recorded": [self._match_summary(item) for item in recorded],
+                "top_links": _top_links(product),
+                "skipped": skipped,
+                "unknown_ids": unknown,
+                "message": "这一批销量已处理。",
+            },
+        )
+
+    def _remember_sale(
+        self,
+        product: dict[str, Any],
+        candidate: dict[str, Any],
+        item: dict[str, Any],
+        source: str,
+        parent_url: str | None,
+        model_name: str,
+        sales_text: str,
+        image_path: str | None = None,
+    ) -> None:
+        if not image_path:
+            self._ensure_candidate_files([candidate], page_url=candidate.get("url") or "")
+            image_path = candidate.get("image_path") or ""
+        if candidate["key"] not in product["checked_keys"]:
+            product["checked_keys"].append(candidate["key"])
+        parent = candidate.get("parent_url") if source == "recommendation" else parent_url
+        product["matches"].append(
+            {
                 "url": candidate["url"],
                 "key": candidate["key"],
                 "title": candidate.get("title") or "",
-                "sales_text": sales["sales_text"],
+                "sales_text": sales_text,
                 "confidence": item["confidence"],
                 "reason": item["reason"],
                 "source": source,
@@ -603,28 +790,41 @@ class SellerAutoService:
                 "ads_scraped": source != "search",
                 "ads_complete": source != "search",
             }
-            product["matches"].append(match)
-            recorded.append(match)
-            browser.close_detail()
-            self._save()
-        images = [
-            (f"美客多详情主图 candidate_id={item['candidate_id']} url={item['url']}", item.get("image_path") or "")
-            for item in recorded
-        ]
-        self._save()
-        return self._payload(
-            {
-                "ok": True,
-                "status": "matches_recorded" if recorded else "no_sales_or_not_similar",
-                "product_id": product["product_id"],
-                "source": source,
-                "recorded": [self._match_summary(item) for item in recorded],
-                "skipped": skipped,
-                "unknown_ids": unknown,
-                "message": "有销量的链接已记录。没有 vendido 的链接不记录。",
-            },
-            images,
         )
+
+    def _attach_followup(self, payload: ToolPayload) -> ToolPayload:
+        """把下一批要看的图放进同一次返回，避免再单独走一步 MCP。"""
+
+        data = payload.data
+        step_name = data.get("next_step")
+        product_id = data.get("product_id")
+        if step_name == "next_listing_batch":
+            follow = self._next_listing_batch()
+            if follow.data.get("status") == "listing_batch":
+                follow.data["message"] = "上一批销量已处理。下面是下一批列表图，请直接 submit_listing_matches，不要再调用 next_listing_batch。"
+                return follow
+            payload = follow
+            data = payload.data
+            step_name = data.get("next_step")
+        if step_name == "next_ad_batch" and product_id:
+            follow = self._next_ad_batch(product_id)
+            if follow.data.get("status") == "ad_batch":
+                follow.data["message"] = "下面是下一条有销量详情的广告图，请直接 submit_ad_matches，不要再调用 next_ad_batch。"
+                return follow
+            return follow
+        data["message"] = self._step_message(str(data.get("message") or ""), str(data.get("next_step") or ""))
+        return payload
+
+    def _step_message(self, done: str, step_name: str) -> str:
+        hints = {
+            "submit_listing_matches": "请提交剩下的列表判断。",
+            "submit_ad_matches": "请提交剩下的广告判断。",
+            "export_results": "这一条商品已筛完，请 export_results。",
+            "next_amazon_product": "请继续 next_amazon_product。",
+            "set_keywords": "请调用 set_keywords。",
+        }
+        hint = hints.get(step_name, "")
+        return f"{done}{hint}" if hint else done
 
     def _ensure_amazon_list(self) -> ToolPayload | None:
         state = self._require_state()
@@ -716,6 +916,7 @@ class SellerAutoService:
                     "image_url": card["image_url"],
                     "image_path": "",
                     "title": card["title"],
+                    "sales_text": card.get("sales_text") or "",
                     "key": card["key"],
                     "page": page_no,
                     "parent_url": "",
@@ -749,7 +950,7 @@ class SellerAutoService:
                 "status": status,
                 "product_id": product["product_id"],
                 "candidates": summaries,
-                "message": "请对比列表图和亚马逊参照图。颜色不同也可以，整体外形和构图要高度相似。然后调用 submit_listing_matches。未判断完不要把它们当成同款。",
+                "message": "请对比这一批列表图和亚马逊参照图后，直接调用 submit_listing_matches。不要再调用 next_listing_batch。未判断完不要把它们当成同款。",
             },
             images,
         )
@@ -770,6 +971,7 @@ class SellerAutoService:
                     "image_url": card["image_url"],
                     "image_path": "",
                     "title": card["title"],
+                    "sales_text": card.get("sales_text") or "",
                     "key": card["key"],
                     "parent_url": match["url"],
                 }
@@ -811,7 +1013,7 @@ class SellerAutoService:
     def _image_stem(self, name: str) -> Path:
         state = self._require_state()
         safe = "".join(char if char.isalnum() or char in "-_" else "_" for char in name)
-        return seller_dir(self.output_dir, state["seller_id"]) / "images" / safe
+        return seller_dir(self.output_dir, _storage_id(state)) / "images" / safe
 
     def _product(self, product_id: str) -> dict[str, Any]:
         state = self._require_state()
@@ -865,6 +1067,10 @@ class _Blocked(Exception):
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__(NEEDS_HUMAN)
         self.payload = payload
+
+
+def _top_links(product: dict[str, Any]) -> list[dict[str, Any]]:
+    return similarity_rows(product)[:10]
 
 
 def _jpeg_file(path: str) -> bytes | None:

@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import random
+import time
 from pathlib import Path
 from typing import Any, Callable
 
+from seller_auto.browser_launch import (
+    STEALTH_JS,
+    mark_clean_shutdown,
+    persistent_context_options,
+    profile_is_busy,
+    read_chromium_version,
+)
 from seller_auto.pacing import Cooldown, DelaySettings
 from seller_auto.urls import looks_like_verification_url, text_looks_blocked
 
@@ -23,18 +32,19 @@ def pages_to_close(page_ids: list[str], keep_ids: list[str]) -> list[str]:
 
 
 def log(message: str) -> None:
-    import sys
+    from seller_auto.step_log import step
 
-    print(message, file=sys.stderr, flush=True)
+    step("浏览器", message)
 
 
 class ArgentinaBrowser:
-    def __init__(self, settings: DelaySettings, profile_dir: Path, headless: bool = False) -> None:
+    def __init__(self, settings: DelaySettings, profile_dir: Path, headless: bool = True) -> None:
         self.settings = settings
         self.profile_dir = profile_dir
+        self.background = headless
         self.headless = headless
-        self.amazon_cooldown = Cooldown(settings.amazon_min_delay, settings.amazon_max_delay)
-        self.ml_cooldown = Cooldown(settings.ml_min_delay, settings.ml_max_delay)
+        self.amazon_cooldown = Cooldown(settings.amazon_min_delay, settings.amazon_max_delay, label="亚马逊")
+        self.ml_cooldown = Cooldown(settings.ml_min_delay, settings.ml_max_delay, label="美客多")
         self._playwright: Any = None
         self.context: Any = None
         self.list_page: Any = None
@@ -47,23 +57,39 @@ class ArgentinaBrowser:
             return
         from playwright.sync_api import sync_playwright
 
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
-        self._playwright = sync_playwright().start()
-        self.context = self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self.profile_dir),
+        self._wait_until_profile_free()
+        if mark_clean_shutdown(self.profile_dir):
+            log("已清掉上次异常退出标记")
+        browsers = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", Path.home() / "Library/Caches/ms-playwright"))
+        options = persistent_context_options(
+            self.profile_dir,
             headless=self.headless,
-            locale="es-AR",
-            timezone_id="America/Argentina/Buenos_Aires",
-            geolocation={"latitude": -34.6037, "longitude": -58.3816},
-            permissions=["geolocation"],
-            viewport={"width": 1440, "height": 900},
-            extra_http_headers={"Accept-Language": "es-AR,es;q=0.9"},
+            chrome_version=read_chromium_version(browsers),
         )
+        Path(options["user_data_dir"]).mkdir(parents=True, exist_ok=True)
+        playwright = sync_playwright().start()
+        try:
+            context = playwright.chromium.launch_persistent_context(**options)
+        except Exception:
+            playwright.stop()
+            raise
+        self._playwright = playwright
+        self.context = context
+        context.add_init_script(STEALTH_JS)
         pages = list(self.context.pages)
         self.list_page = pages[0] if pages else self.context.new_page()
         self.detail_page = None
         self.trim_tabs()
         self._configure(self.list_page)
+        if self.headless:
+            log("已在后台启动完整 Chrome，没有打开窗口。")
+        else:
+            log("已打开前台窗口。")
+
+    def _wait_until_profile_free(self) -> None:
+        deadline = time.monotonic() + 8
+        while profile_is_busy(self.profile_dir) and time.monotonic() < deadline:
+            time.sleep(0.2)
 
     def close(self) -> None:
         if self.context is not None:
@@ -100,10 +126,12 @@ class ArgentinaBrowser:
                     log("关闭多余标签失败")
 
     def close_detail(self) -> None:
-        if self.detail_page is not None and self.detail_page is not self.list_page:
+        closing = self.detail_page is not None and self.detail_page is not self.list_page
+        if closing:
             try:
                 if not self.detail_page.is_closed():
                     self.detail_page.close()
+                    log("已关闭详情标签")
             except Exception:
                 log("关闭详情标签失败")
         self.detail_page = None
@@ -146,11 +174,15 @@ class ArgentinaBrowser:
 
     def ensure_clear(self, page: Any, site: str) -> dict[str, Any] | None:
         if not self.needs_verification(page):
+            if self.background and not self.headless:
+                self._return_to_background(page)
             return self._reward_if_cleared(site)
         self.challenge_pending = True
         self.challenge_site = site
-        log("需要手动验证，请在弹出的浏览器里完成")
+        page = self._show_for_verification(page)
+        log("需要手动验证，请在前台窗口里完成")
         if self._wait_until_clear(page, timeout=90):
+            self._return_to_background(page)
             return self._reward_if_cleared(site)
         return {
             "ok": False,
@@ -181,17 +213,31 @@ class ArgentinaBrowser:
             time.sleep(2)
         return not self.needs_verification(page)
 
-    def goto(self, page: Any, url: str) -> None:
-        page.goto(url, wait_until="domcontentloaded")
+    def goto(self, page: Any, url: str, timeout: float | None = None) -> None:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
-    def open_detail(self, url: str) -> Any:
+        options: dict[str, Any] = {"wait_until": "commit"}
+        if timeout is not None:
+            options["timeout"] = timeout
+        log(f"打开页面 {url}")
+        page.goto(url, **options)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=timeout or 45000)
+        except PlaywrightTimeout:
+            log("页面已离开空白页，正文仍在加载")
+
+    def open_detail(self, url: str, timeout: float | None = None) -> Any:
         self.start()
         self.close_detail()
         page = self.context.new_page()
         self.detail_page = page
         self._configure(page)
         self.trim_tabs()
-        self.goto(page, url)
+        try:
+            self.goto(page, url, timeout=timeout)
+        except Exception:
+            self.close_detail()
+            raise
         return page
 
     def click_result(self, locator: Any) -> tuple[Any, bool]:
@@ -235,6 +281,62 @@ class ArgentinaBrowser:
             if self.list_page.url != list_url:
                 self.goto(self.list_page, list_url)
         self.trim_tabs()
+
+    def live_page(self, page: Any) -> Any:
+        try:
+            if page is not None and not page.is_closed():
+                return page
+        except Exception:
+            pass
+        if self.detail_page is not None:
+            try:
+                if not self.detail_page.is_closed():
+                    return self.detail_page
+            except Exception:
+                pass
+        return self.list_page
+
+    def _page_url(self, page: Any) -> str:
+        try:
+            return page.url or ""
+        except Exception:
+            return ""
+
+    def _show_for_verification(self, page: Any) -> Any:
+        if not self.headless:
+            return page
+        detail = page is self.detail_page and page is not self.list_page
+        urls = self._urls_to_restore(page, detail)
+        log("需要手动验证，暂时打开前台窗口")
+        self._reopen(headless=False, urls=urls, restore_detail=detail)
+        return self.detail_page if detail and self.detail_page is not None else self.list_page
+
+    def _return_to_background(self, page: Any) -> None:
+        if not self.background or self.headless:
+            return
+        detail = page is self.detail_page and page is not self.list_page
+        urls = self._urls_to_restore(page, detail)
+        log("验证已通过，浏览器回到后台")
+        self._reopen(headless=True, urls=urls, restore_detail=detail)
+
+    def _urls_to_restore(self, page: Any, detail: bool) -> list[str]:
+        current = self._page_url(page)
+        list_url = self._page_url(self.list_page)
+        if detail:
+            return [url for url in (list_url, current) if url and not url.startswith("about:")]
+        if current and not current.startswith("about:"):
+            return [current]
+        return []
+
+    def _reopen(self, *, headless: bool, urls: list[str], restore_detail: bool) -> None:
+        self.headless = headless
+        self.close()
+        self.start()
+        if not urls:
+            return
+        self.goto(self.list_page, urls[0])
+        if restore_detail and len(urls) > 1:
+            self.open_detail(urls[1])
 
     def download_bytes(self, url: str, referer: str) -> bytes:
         response = self.context.request.get(

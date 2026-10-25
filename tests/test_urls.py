@@ -10,8 +10,11 @@ from seller_auto.urls import (
     ml_page2_url,
     ml_search_url,
     parse_brand,
+    parse_focus_product,
     parse_seller_id,
+    resolve_store_input,
     slugify_keywords,
+    store_url_for_seller,
 )
 
 
@@ -25,6 +28,27 @@ class UrlTests(unittest.TestCase):
     def test_parse_seller_id_rejects_non_amazon(self) -> None:
         with self.assertRaises(UrlError):
             parse_seller_id("https://listado.mercadolibre.com.ar/s?me=A1A10HFD4KEZW5")
+
+    def test_seller_id_builds_the_store_url(self) -> None:
+        seller_id, store_url = resolve_store_input("处理这个店铺id：A1A10HFD4KEZW5")
+        self.assertEqual(seller_id, "A1A10HFD4KEZW5")
+        self.assertEqual(store_url, STORE)
+        self.assertEqual(store_url_for_seller("A1A10HFD4KEZW5"), STORE)
+
+    def test_full_store_url_is_still_accepted(self) -> None:
+        seller_id, store_url = resolve_store_input(STORE)
+        self.assertEqual((seller_id, store_url), ("A1A10HFD4KEZW5", STORE))
+
+    def test_focus_product_accepts_asin_or_url(self) -> None:
+        self.assertEqual(parse_focus_product(""), "")
+        self.assertEqual(parse_focus_product("B0D25PTTTQ"), "B0D25PTTTQ")
+        self.assertEqual(
+            parse_focus_product("https://www.amazon.com.mx/dp/B0D25PTTTQ/ref=sr"),
+            "B0D25PTTTQ",
+        )
+        self.assertEqual(parse_focus_product("只处理这个商品：B0D25PTTTQ"), "B0D25PTTTQ")
+        with self.assertRaises(UrlError):
+            resolve_store_input("店铺id：")
 
     def test_search_url_matches_the_sample_shape(self) -> None:
         keywords = "Funda para Burro de Planchar Grande"

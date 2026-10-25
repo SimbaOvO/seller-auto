@@ -36,6 +36,11 @@ class ToolContractTests(unittest.TestCase):
         self.assertIn("model_name", schema["properties"])
         self.assertIn("matches", schema["required"])
         self.assertNotIn("model_name", schema["required"])
+        open_store = tools["open_store"].parameters
+        self.assertIn("seller_id", open_store["properties"])
+        self.assertNotIn("url", open_store["properties"])
+        self.assertIn("seller_id", open_store["required"])
+        self.assertIn("open_store(seller_id, product)", INSTRUCTIONS)
         self.assertIn("颜色", INSTRUCTIONS)
         self.assertIn("高度相似", INSTRUCTIONS)
         self.assertIn(INSTRUCTIONS, server.instructions or "")
@@ -79,9 +84,28 @@ class StorageTests(unittest.TestCase):
                     "keywords": "funda para burro de planchar",
                     "image_path": "images/B0C1234567.jpg",
                     "ml_search_url": "https://listado.mercadolibre.com.ar/funda",
+                    "listing": {
+                        "candidates": [
+                            {
+                                "candidate_id": "low",
+                                "url": "https://www.mercadolibre.com.ar/p/MLA0",
+                                "title": "Otra",
+                                "similarity": 0.81,
+                                "similar": True,
+                            },
+                            {
+                                "candidate_id": "high",
+                                "url": "https://www.mercadolibre.com.ar/p/MLA9?tracking=1#x",
+                                "title": "Mejor",
+                                "similarity": 0.97,
+                                "similar": True,
+                            },
+                        ]
+                    },
                     "matches": [
                         {
-                            "url": "https://www.mercadolibre.com.ar/p/MLA1",
+                            "candidate_id": "sold-low",
+                            "url": "https://www.mercadolibre.com.ar/p/MLA1?tracking=1#x",
                             "sales_text": "+25 vendidos",
                             "confidence": 0.91,
                             "reason": "外形一致",
@@ -90,7 +114,19 @@ class StorageTests(unittest.TestCase):
                             "image_path": "images/MLA1.jpg",
                             "model_name": "client-model",
                             "title": "Funda grande",
-                        }
+                        },
+                        {
+                            "candidate_id": "sold-high",
+                            "url": "https://www.mercadolibre.com.ar/p/MLA2",
+                            "sales_text": "+100 vendidos",
+                            "confidence": 0.96,
+                            "reason": "外形更接近",
+                            "source": "search",
+                            "parent_url": None,
+                            "image_path": "images/MLA2.jpg",
+                            "model_name": "client-model",
+                            "title": "Funda mejor",
+                        },
                     ],
                 }
             },
@@ -98,7 +134,12 @@ class StorageTests(unittest.TestCase):
         exported = build_export(state)
         self.assertEqual(exported["model_names"], ["client-model"])
         self.assertEqual(exported["products"][0]["mercadolibre_matches"][0]["source"], "search")
-        self.assertEqual(exported["products"][0]["mercadolibre_matches"][0]["similarity"], 0.91)
+        self.assertEqual(exported["products"][0]["mercadolibre_matches"][0]["candidate_id"], "sold-high")
+        self.assertEqual(exported["products"][0]["mercadolibre_matches"][0]["similarity"], 0.96)
+        self.assertEqual(exported["products"][0]["top_links"][0]["candidate_id"], "sold-high")
+        self.assertEqual([item["candidate_id"] for item in exported["products"][0]["top_links"]], ["sold-high", "sold-low"])
+        self.assertNotIn("tracking", exported["products"][0]["top_links"][1]["url"])
+        self.assertNotIn("high", [item["candidate_id"] for item in exported["products"][0]["top_links"]])
         self.assertEqual(exported["excluded"][0]["reason"], "食品")
 
         with tempfile.TemporaryDirectory() as directory:

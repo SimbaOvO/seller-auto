@@ -27,6 +27,32 @@ def parse_seller_id(url: str) -> str:
     return seller
 
 
+def store_url_for_seller(seller_id: str) -> str:
+    return f"{AMAZON_BASE}/s?me={seller_id}&marketplaceID={seller_id}"
+
+
+def resolve_store_input(value: str) -> tuple[str, str]:
+    """从店铺 id、`处理这个店铺id：xxx` 或整段店铺链接得到卖家 id 和标准店铺地址。"""
+
+    text = " ".join((value or "").split())
+    if not text:
+        raise UrlError("请提供店铺 id")
+    if text.startswith(("http://", "https://")):
+        seller_id = parse_seller_id(text)
+    else:
+        labeled = re.search(r"(?:店铺|卖家)\s*id\s*[:：]\s*([A-Za-z0-9]+)", text, flags=re.IGNORECASE)
+        embedded = re.search(r"(?:^|[?&])me=([A-Za-z0-9]+)", text)
+        if labeled:
+            seller_id = labeled.group(1)
+        elif embedded:
+            seller_id = embedded.group(1)
+        elif re.fullmatch(r"[A-Za-z0-9]+", text):
+            seller_id = text
+        else:
+            raise UrlError("店铺 id 只能包含字母和数字")
+    return seller_id, store_url_for_seller(seller_id)
+
+
 def absolute_amazon_url(href: str, base: str = AMAZON_BASE) -> str:
     if not href:
         return ""
@@ -43,6 +69,28 @@ def extract_asin(url: str) -> str:
     if match and re.fullmatch(r"[A-Z0-9]{10}", match.group(1)):
         return match.group(1).upper()
     return ""
+
+
+def parse_focus_product(value: str) -> str:
+    """空字符串表示遍历整个店铺。否则返回要单独处理的 ASIN。"""
+
+    text = " ".join((value or "").split())
+    if not text:
+        return ""
+    labeled = re.search(r"(?:商品|链接|asin)\s*[:：]\s*(\S+)", text, flags=re.IGNORECASE)
+    if labeled:
+        text = labeled.group(1)
+    if text.startswith(("http://", "https://")):
+        asin = extract_asin(text)
+        if not asin:
+            raise UrlError("商品链接里没有 ASIN")
+        return asin
+    if re.fullmatch(r"[A-Z0-9]{10}", text, flags=re.IGNORECASE):
+        return text.upper()
+    asin = extract_asin(text)
+    if asin:
+        return asin
+    raise UrlError("指定商品请提供 10 位 ASIN，或亚马逊商品链接")
 
 
 def canonical_amazon_url(url: str) -> str:

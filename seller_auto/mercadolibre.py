@@ -14,10 +14,38 @@ SALES_SELECTOR = (
     "> div > div.ui-pdp-header__subtitle"
 )
 GRID_SELECTOR = ".ui-search-layout.ui-search-layout--grid"
-AD_SELECTORS = (
-    ".ui-recommendations-carousel-snapped",
-    ".ui-recommendations-list.ui-recommendations-list__container--pads.ui-box-component-pdp__visible--desktop",
+AD_CAROUSEL_SELECTOR = ".ui-recommendations-carousel-snapped"
+AD_TITLE_SELECTOR = ".ui-recommendations-title-link"
+WANTED_AD_TITLES = (
+    "productos relacionados",
+    "quienes vieron este producto también compraron",
 )
+MATCHING_AD_COUNT_SCRIPT = """
+() => {
+  const wanted = new Set([
+    "productos relacionados",
+    "quienes vieron este producto también compraron",
+  ]);
+  const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim().toLowerCase();
+  return [...document.querySelectorAll(".ui-recommendations-carousel-snapped")].reduce((count, block) => {
+    const title = block.querySelector(".ui-recommendations-title-link");
+    return count + (title && wanted.has(normalize(title.textContent)) ? 1 : 0);
+  }, 0);
+}
+"""
+MATCHING_AD_INDEXES_SCRIPT = """
+() => {
+  const wanted = new Set([
+    "productos relacionados",
+    "quienes vieron este producto también compraron",
+  ]);
+  const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim().toLowerCase();
+  return [...document.querySelectorAll(".ui-recommendations-carousel-snapped")].flatMap((block, index) => {
+    const title = block.querySelector(".ui-recommendations-title-link");
+    return title && wanted.has(normalize(title.textContent)) ? [index] : [];
+  });
+}
+"""
 CARD_SCRIPT = """
 (root) => {
   const images = [...root.querySelectorAll('img.poly-component__picture')];
@@ -36,7 +64,23 @@ CARD_SCRIPT = """
     }
     if (!title) title = el.getAttribute('alt') || '';
     const src = el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src') || '';
-    return {href, src, title: (title || '').replace(/\\s+/g, ' ').trim()};
+    let sales = '';
+    if (card) {
+      const sold = card.querySelector(
+        '.poly-component__sold-quantity, .ui-search-item__group__element--sold, [class*="sold-quantity"]'
+      );
+      sales = sold ? (sold.textContent || '') : '';
+      if (!/vendidos?/i.test(sales)) {
+        const found = (card.innerText || '').match(/\\+?\\d[\\d.]*\\s*vendidos?/i);
+        sales = found ? found[0] : '';
+      }
+    }
+    return {
+      href,
+      src,
+      title: (title || '').replace(/\\s+/g, ' ').trim(),
+      sales: (sales || '').replace(/\\s+/g, ' ').trim(),
+    };
   });
 }
 """
@@ -80,44 +124,107 @@ def collect_grid_cards(page: Any) -> list[dict[str, str]]:
     return _dedupe_cards(raw_cards, page.url)
 
 
-def collect_ad_cards(page: Any, pause: Any) -> list[dict[str, str]]:
-    """慢速滚过广告位，并在每一屏收集当前可见的主图。"""
+def note_ad_block_count(previous: int, current: int, stable_rounds: int) -> tuple[int, bool]:
+    """广告位分几块懒加载。数量连续两次不变，才算这几块都出来了。"""
 
+    if current > 0 and current == previous:
+        stable_rounds += 1
+    else:
+        stable_rounds = 0
+    return stable_rounds, stable_rounds >= 2
+
+
+def is_wanted_ad_title(text: str) -> bool:
+    normalized = " ".join((text or "").split()).casefold()
+    return normalized in WANTED_AD_TITLES
+
+
+def collect_ad_cards(page: Any, pause: Any) -> list[dict[str, str]]:
+    """只收集三个指定轮播：两块 Productos relacionados，一块 Quienes vieron este producto también compraron。"""
+
+    _wait_for_ad_blocks(page, pause)
     cards: list[dict[str, str]] = []
     seen: set[str] = set()
-    for selector in AD_SELECTORS:
-        containers = page.locator(selector)
-        for index in range(containers.count()):
-            container = containers.nth(index)
-            try:
-                container.scroll_into_view_if_needed(timeout=5000)
-            except Exception:
-                pass
-            last_position = -1.0
-            for _ in range(6):
-                _absorb_cards(cards, seen, _cards_from(container, page.url))
-                try:
-                    position = float(
-                        container.evaluate(
-                            """el => {
-                                const scroller = el.querySelector(
-                                    '.andes-carousel-snapped__scroll, [class*="scroll"]'
-                                ) || el;
-                                const before = scroller.scrollLeft || 0;
-                                const delta = Math.max((scroller.clientWidth || 480) * 0.9, 280);
-                                scroller.scrollLeft = before + delta;
-                                return scroller.scrollLeft || 0;
-                            }"""
-                        )
-                    )
-                except Exception:
-                    break
-                if position == last_position:
-                    break
-                last_position = position
-                pause()
+    carousels = page.locator(AD_CAROUSEL_SELECTOR)
+    for index in _matching_ad_indexes(page):
+        container = carousels.nth(index)
+        try:
+            container.scroll_into_view_if_needed(timeout=8000)
+        except Exception:
+            pass
+        _wait_for_pictures(container, pause)
+        last_position = -1.0
+        for _ in range(6):
             _absorb_cards(cards, seen, _cards_from(container, page.url))
+            try:
+                position = float(
+                    container.evaluate(
+                        """el => {
+                            const scroller = el.querySelector(
+                                '.andes-carousel-snapped__scroll, [class*="scroll"]'
+                            ) || el;
+                            const before = scroller.scrollLeft || 0;
+                            const delta = Math.max((scroller.clientWidth || 480) * 0.9, 280);
+                            scroller.scrollLeft = before + delta;
+                            return scroller.scrollLeft || 0;
+                        }"""
+                    )
+                )
+            except Exception:
+                break
+            if position == last_position:
+                break
+            last_position = position
+            pause()
+        _absorb_cards(cards, seen, _cards_from(container, page.url))
     return cards
+
+
+def _matching_ad_indexes(page: Any) -> list[int]:
+    try:
+        indexes = page.evaluate(MATCHING_AD_INDEXES_SCRIPT)
+    except Exception:
+        return []
+    return [int(index) for index in indexes or []]
+
+
+def _wait_for_ad_blocks(page: Any, pause: Any) -> int:
+    previous = -1
+    stable_rounds = 0
+    count = 0
+    for _ in range(8):
+        try:
+            page.mouse.wheel(0, 1600)
+        except Exception:
+            break
+        pause()
+        try:
+            count = int(page.evaluate(MATCHING_AD_COUNT_SCRIPT))
+        except Exception:
+            count = 0
+        stable_rounds, settled = note_ad_block_count(previous, count, stable_rounds)
+        previous = count
+        if count >= 3 and settled:
+            break
+        if settled and count > 0 and _ >= 4:
+            break
+    return count
+
+
+def _wait_for_pictures(container: Any, pause: Any) -> None:
+    for _ in range(3):
+        try:
+            ready = container.evaluate(
+                """el => {
+                    const img = el.querySelector('img.poly-component__picture');
+                    return !!(img && (img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src')));
+                }"""
+            )
+        except Exception:
+            return
+        if ready:
+            return
+        pause()
 
 
 def _cards_from(root: Any, base_url: str) -> list[dict[str, str]]:
@@ -158,11 +265,22 @@ def open_next_results_page(page: Any, search_url: str) -> bool:
     return True
 
 
+def _is_product_href(href: str) -> bool:
+    lowered = (href or "").lower()
+    if not lowered or "mercadolibre." not in lowered:
+        return False
+    if "click1.mercadolibre" in lowered or "/mclics/" in lowered:
+        return False
+    return True
+
+
 def _dedupe_cards(raw_cards: list[dict[str, Any]], base_url: str) -> list[dict[str, str]]:
     cards: list[dict[str, str]] = []
     seen: set[str] = set()
     for raw in raw_cards or []:
         href = absolute_amazon_url(str(raw.get("href") or ""), base_url)
+        if not _is_product_href(href):
+            continue
         image = absolute_amazon_url(str(raw.get("src") or ""), base_url)
         if not href:
             continue
@@ -175,6 +293,7 @@ def _dedupe_cards(raw_cards: list[dict[str, Any]], base_url: str) -> list[dict[s
                 "url": href,
                 "image_url": image,
                 "title": str(raw.get("title") or "").strip(),
+                "sales_text": " ".join(str(raw.get("sales") or "").split()),
                 "key": key,
             }
         )

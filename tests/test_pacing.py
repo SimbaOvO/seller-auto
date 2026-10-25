@@ -37,9 +37,9 @@ class CooldownTests(unittest.TestCase):
         cooldown = Cooldown(12, 25, sleep=sleep, now=lambda: clock["t"], rng=lambda _low, _high: next(samples))
         first = cooldown.acquire()
         second = cooldown.acquire()
-        self.assertEqual(first, 12)
-        self.assertEqual(second, 20)
-        self.assertEqual(slept, [12, 20])
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 12)
+        self.assertEqual(slept, [12])
 
     def test_early_second_call_waits_only_the_remaining_time(self) -> None:
         clock = {"t": 50.0}

@@ -1,0 +1,12 @@
+---
+description: seller-auto 的元素判断和主图对比使用 grok 4.6 low fast
+alwaysApply: true
+---
+
+# seller-auto 模型
+
+风控间隔保持原样：亚马逊点击之间 8–15 秒，美客多搜索、翻页、打开详情和广告详情之间 12–25 秒。不要为了提速删掉这些等待，也不要每条链接新开一个浏览器窗口。浏览器默认在后台运行，使用完整的 Chrome for Testing，不用 headless shell。去掉 webdriver 和 HeadlessChrome 这些自动化标记；不要伪造画布、WebGL 或操作系统。需要手动验证时才短暂打开前台窗口，完成后回到后台。
+
+检索目标元素、判断广告位标题，以及对比亚马逊和美客多主图是否同款，使用 grok 4.6 low fast。模型 id 是 `grok-4.6`，参数 `effort=low`、`fast=true`。子代理和提交记录都写 `cursor-grok-4.6-low-fast`，不要只写 `grok-4.6`。若当前对话不是这个模型，用子代理执行这两步，并指定模型 cursor-grok-4.6-low-fast。子代理只看给定图片和元素文本，返回 JSON，不改项目文件。
+
+提交 `submit_listing_matches` 和 `submit_ad_matches` 时，`model_name` 填 `cursor-grok-4.6-low-fast`。

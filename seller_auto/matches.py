@@ -42,7 +42,7 @@ def normalize_match(raw: Any) -> dict[str, Any]:
 
 
 def filter_matches(matches: list[Any], threshold: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """只保留 similar 且置信度达到阈值的判断。"""
+    """只保留 similar 且置信度达到阈值的判断。达到标准的全部进入后续销量筛选。"""
 
     if not 0 <= threshold <= 1:
         raise MatchInputError("相似度阈值必须在 0 到 1 之间")

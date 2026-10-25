@@ -32,7 +32,7 @@ class DelaySettings:
     similarity_threshold: float = 0.8
     max_pages: int = 0
     max_products: int = 0
-    headless: bool = False
+    headless: bool = True
     profile_dir: str = "data/profile"
     output_dir: str = "output"
 
@@ -67,6 +67,7 @@ class DelaySettings:
         parser.add_argument("--max-pages", type=int, default=0)
         parser.add_argument("--max-products", type=int, default=0)
         parser.add_argument("--headless", action="store_true")
+        parser.add_argument("--foreground", action="store_true")
         parser.add_argument("--profile-dir", default="data/profile")
         parser.add_argument("--output-dir", default="output")
         args, _unknown = parser.parse_known_args(argv)
@@ -78,7 +79,7 @@ class DelaySettings:
             similarity_threshold=args.similarity_threshold,
             max_pages=args.max_pages,
             max_products=args.max_products,
-            headless=args.headless,
+            headless=(not args.foreground) or args.headless,
             profile_dir=args.profile_dir,
             output_dir=args.output_dir,
         )
@@ -86,10 +87,10 @@ class DelaySettings:
 
 
 class Cooldown:
-    """两次导航之间必须等满一个随机间隔。
+    """两次实际打开页面之间必须等满一个随机间隔。
 
-    第一次调用也会先等满一个间隔，这样从亚马逊切到美客多时不会立刻打开搜索页。
-    如果上一个间隔还没结束，本次只补足剩余时间。
+    第一次打开不等待，避免浏览器停在 about:blank 上空等。
+    之后如果上一个间隔还没结束，本次只补足剩余时间。
     """
 
     def __init__(
@@ -99,6 +100,7 @@ class Cooldown:
         sleep: Callable[[float], None] | None = None,
         now: Callable[[], float] | None = None,
         rng: Callable[[float, float], float] | None = None,
+        label: str = "",
     ) -> None:
         if min_seconds < 0 or max_seconds < 0 or min_seconds > max_seconds:
             raise DelayError("冷却间隔不合法")
@@ -108,6 +110,7 @@ class Cooldown:
         self._now = now or time.monotonic
         self._rng = rng or random.uniform
         self.ready_at: float | None = None
+        self.label = label
 
     def sample(self) -> float:
         return float(self._rng(self.min_seconds, self.max_seconds))
@@ -115,11 +118,15 @@ class Cooldown:
     def acquire(self) -> float:
         now = self._now()
         if self.ready_at is None:
-            wait = self.sample()
-        else:
-            wait = max(0.0, self.ready_at - now)
+            self.ready_at = now + self.sample()
+            return 0.0
+        wait = max(0.0, self.ready_at - now)
         if wait > 0:
             self._sleep(wait)
+            if self.label:
+                from seller_auto.step_log import step
+
+                step("风控等待", f"{self.label} {wait:.0f} 秒")
         self.ready_at = self._now() + self.sample()
         return wait
 
