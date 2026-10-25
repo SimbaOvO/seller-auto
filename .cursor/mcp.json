@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "seller-auto": {
+      "command": ".venv/bin/python",
+      "args": ["-m", "seller_auto.mcp_server"]
+    }
+  }
+}
