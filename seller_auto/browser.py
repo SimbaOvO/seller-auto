@@ -226,12 +226,19 @@ class ArgentinaBrowser:
         except PlaywrightTimeout:
             log("页面已离开空白页，正文仍在加载")
 
-    def open_detail(self, url: str, timeout: float | None = None) -> Any:
+    def open_detail(
+        self,
+        url: str,
+        timeout: float | None = None,
+        viewport: tuple[int, int] | None = None,
+    ) -> Any:
         self.start()
         self.close_detail()
         page = self.context.new_page()
         self.detail_page = page
         self._configure(page)
+        if viewport is not None:
+            page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
         self.trim_tabs()
         try:
             self.goto(page, url, timeout=timeout)
@@ -311,12 +318,32 @@ class ArgentinaBrowser:
         self._reopen(headless=False, urls=urls, restore_detail=detail)
         return self.detail_page if detail and self.detail_page is not None else self.list_page
 
-    def _return_to_background(self, page: Any) -> None:
+    def reveal(self, page: Any, reason: str) -> Any:
+        """需要登录时把当前页放到前台，返回重新打开后的页面。"""
+
+        if not self.headless:
+            return page
+        detail = page is self.detail_page and page is not self.list_page
+        urls = self._urls_to_restore(page, detail)
+        log(reason)
+        self._reopen(headless=False, urls=urls, restore_detail=detail)
+        shown = self.detail_page if detail and self.detail_page is not None else self.list_page
+        return shown or page
+
+    def restore_background(self, page: Any) -> Any:
+        if not self.background or self.headless:
+            return page
+        detail = page is self.detail_page and page is not self.list_page
+        self._return_to_background(page, "登录已完成，浏览器回到后台")
+        shown = self.detail_page if detail and self.detail_page is not None else self.list_page
+        return shown or page
+
+    def _return_to_background(self, page: Any, message: str = "验证已通过，浏览器回到后台") -> None:
         if not self.background or self.headless:
             return
         detail = page is self.detail_page and page is not self.list_page
         urls = self._urls_to_restore(page, detail)
-        log("验证已通过，浏览器回到后台")
+        log(message)
         self._reopen(headless=True, urls=urls, restore_detail=detail)
 
     def _urls_to_restore(self, page: Any, detail: bool) -> list[str]:

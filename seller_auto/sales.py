@@ -5,12 +5,22 @@ from __future__ import annotations
 import re
 
 _SOLD = re.compile(r"vendidos?", re.IGNORECASE)
+_COUNT = re.compile(r"\+?\s*(\d[\d.]*)\s*vendidos?", re.IGNORECASE)
 
 
 def has_sales(text: str) -> bool:
     """有 “vendido” 或 “vendidos” 才算有销量。"""
 
     return _SOLD.search(text or "") is not None
+
+
+def sales_count(text: str) -> int:
+    """从销量文案取出数字。阿根廷用点当分位，+1.000 vendidos 是 1000。"""
+
+    match = _COUNT.search(text or "")
+    if not match:
+        return 0
+    return int(match.group(1).replace(".", ""))
 
 
 def sales_action(source: str, sales_text: str | None) -> str:

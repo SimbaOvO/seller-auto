@@ -34,8 +34,7 @@ def main() -> None:
         server.close()
         SOCKET_PATH.unlink(missing_ok=True)
         PID_PATH.unlink(missing_ok=True)
-        if service.browser is not None:
-            service.browser.close()
+        service.close()
         step("后台", "已退出")
 
 

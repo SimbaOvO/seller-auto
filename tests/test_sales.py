@@ -1,6 +1,6 @@
 import unittest
 
-from seller_auto.sales import has_sales, sales_action
+from seller_auto.sales import has_sales, sales_action, sales_count
 
 
 class SalesTests(unittest.TestCase):
@@ -13,6 +13,12 @@ class SalesTests(unittest.TestCase):
         self.assertFalse(has_sales("Nuevo"))
         self.assertFalse(has_sales("4.8 (123)"))
         self.assertFalse(has_sales(""))
+
+    def test_sales_count_reads_argentine_thousands(self) -> None:
+        self.assertEqual(sales_count("+500 vendidos"), 500)
+        self.assertEqual(sales_count("Nuevo | +1.000 vendidos"), 1000)
+        self.assertEqual(sales_count("1 vendido"), 1)
+        self.assertEqual(sales_count("Nuevo"), 0)
 
     def test_card_text_decides_whether_to_open_the_detail(self) -> None:
         self.assertEqual(sales_action("search", "+5 vendidos"), "record")

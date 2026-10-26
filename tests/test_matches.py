@@ -1,6 +1,11 @@
 import unittest
 
-from seller_auto.matches import MatchInputError, filter_matches, normalize_match
+from seller_auto.matches import (
+    MatchInputError,
+    filter_matches,
+    normalize_match,
+    title_obviously_different,
+)
 
 
 class MatchTests(unittest.TestCase):
@@ -24,6 +29,20 @@ class MatchTests(unittest.TestCase):
     def test_threshold_out_of_range(self) -> None:
         with self.assertRaises(MatchInputError):
             filter_matches([], 1.2)
+
+    def test_obvious_title_mismatch_is_dropped(self) -> None:
+        amazon = "Cubierta de Hendidura de Estufa de Silicona"
+        self.assertTrue(title_obviously_different(amazon, "Campana Purif. D.c Cristal 60cm Motor Acero C/luz"))
+        self.assertTrue(title_obviously_different(amazon, "Soporte para celular plegable"))
+
+    def test_related_or_uncertain_titles_stay_for_images(self) -> None:
+        amazon = "Cubierta de Hendidura de Estufa de Silicona"
+        self.assertFalse(title_obviously_different(amazon, "2 Cubiertas Flexibles Para Huecos Para Estufas De Cocina"))
+        self.assertFalse(title_obviously_different(amazon, "Cubre ranuras para estufa"))
+        self.assertFalse(title_obviously_different(amazon, "Tapa de silicona para cocina"))
+        self.assertFalse(title_obviously_different(amazon, "Tapa"))
+        self.assertFalse(title_obviously_different(amazon, ""))
+        self.assertFalse(title_obviously_different("", "Campana extractora"))
 
 
 if __name__ == "__main__":

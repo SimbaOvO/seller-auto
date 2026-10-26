@@ -1,5 +1,5 @@
 ---
-description: seller-auto 的元素判断和主图对比使用 grok 4.6 low fast
+description: seller-auto 使用 grok 4.5 low fast
 alwaysApply: true
 ---
 
@@ -7,6 +7,12 @@ alwaysApply: true
 
 风控间隔保持原样：亚马逊点击之间 8–15 秒，美客多搜索、翻页、打开详情和广告详情之间 12–25 秒。不要为了提速删掉这些等待，也不要每条链接新开一个浏览器窗口。浏览器默认在后台运行，使用完整的 Chrome for Testing，不用 headless shell。去掉 webdriver 和 HeadlessChrome 这些自动化标记；不要伪造画布、WebGL 或操作系统。需要手动验证时才短暂打开前台窗口，完成后回到后台。
 
-检索目标元素、判断广告位标题，以及对比亚马逊和美客多主图是否同款，使用 grok 4.6 low fast。模型 id 是 `grok-4.6`，参数 `effort=low`、`fast=true`。子代理和提交记录都写 `cursor-grok-4.6-low-fast`，不要只写 `grok-4.6`。若当前对话不是这个模型，用子代理执行这两步，并指定模型 cursor-grok-4.6-low-fast。子代理只看给定图片和元素文本，返回 JSON，不改项目文件。
+检索目标元素和判断广告位标题使用 grok 4.5 low fast。模型 id 是 `grok-4.5`，参数 `effort=low`、`fast=true`。名字写 `cursor-grok-4.5-low-fast`，不要只写 `grok-4.5`。
 
-提交 `submit_listing_matches` 和 `submit_ad_matches` 时，`model_name` 填 `cursor-grok-4.6-low-fast`。
+拿到列表批或广告批后，先对照亚马逊标题看每个候选标题。服务端已经按标题跳过的不必再看。剩下的里，标题已经能明显看出不是同一商品的，直接记 similar=false、confidence=1、reason 写标题明显不同，不要把这些编号交给看图子代理。只有标题对得上或拿不准的，再按每 4 张切成一组看图。同一轮并行启动这些子代理，模型都指定 `cursor-grok-4.5-low-fast`。不要写成方括号参数，也不要换成 `grok-4.7-low-fast`、`grok-4.7-high-fast`、`cursor-grok-4.6-low-fast` 或 `cursor-grok-4.6-high-fast`。一批 24 张就是 6 个。每个子代理只看参照图和自己这组的候选编号、图片、标题，返回 JSON 数组，字段是 candidate_id、similar、confidence、reason。子代理不调用 MCP，也不改项目文件。全部返回后，主代理把标题过滤和看图结果合并成一次 submit_listing_matches 或 submit_ad_matches，model_name 填 `cursor-grok-4.5-low-fast`。不要串行看完整批，也不要按组分别提交。
+
+用户说「处理这个店铺id：A，只处理这个商品：B」时，第一次工具调用只能是 open_product(seller_id=A, product=B)。不要搜索项目代码，不要先调用 open_store，不要查会话。打开商品后立刻 set_keywords 去美客多；set_keywords 会直接带回第一批列表图，已经有图就提交判断，不要再调用 next_listing_batch。卖家精灵和货源查询由后台并行完成，不要等它们。
+
+提交 `submit_listing_matches` 和 `submit_ad_matches` 时，`model_name` 填 `cursor-grok-4.5-low-fast`。
+
+调用 set_keywords 时带上 chinese_name，把商品标题译成简短中文名。SKU 用西班牙语关键词。export_results 会用整理好的美客多链接去蓝鲸选品查 30 天销量，名称写成「中文名商品（xx单）」，并按美客多运费表把尾程运费写入 FBA 运费。没有同款的商品不写入表格。不要自己打开蓝鲸。

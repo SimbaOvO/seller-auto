@@ -22,22 +22,34 @@ from seller_auto.amazon import (
 from seller_auto.browser import NEEDS_HUMAN, ArgentinaBrowser, log
 from seller_auto.categories import category_reason, classify_breadcrumb
 from seller_auto.images import save_original, to_client_jpeg
-from seller_auto.matches import MatchInputError, filter_matches
+from seller_auto.lingdong import collect_market_quotes, quote_links
+from seller_auto.matches import (
+    TITLE_FILTER_MODEL,
+    TITLE_MISMATCH_REASON,
+    MatchInputError,
+    filter_matches,
+    title_obviously_different,
+)
 from seller_auto.mercadolibre import (
     collect_ad_cards,
     collect_grid_cards,
     hero_image_url,
     hero_locator,
     open_next_results_page,
+    read_price,
     read_sales_text,
     sales_from_text,
 )
+from seller_auto.workbook import template_path, write_product_workbook
 from seller_auto.pacing import DelaySettings
 from seller_auto.sales import sales_action
+from seller_auto.sellersprite import read_package_size
+from seller_auto.sourcing import read_source_average
 from seller_auto.progress import next_required_step
 from seller_auto.storage import (
     atomic_write_json,
     build_export,
+    discard_finished_images,
     export_filename,
     find_state_by_session,
     load_json,
@@ -59,9 +71,9 @@ class ToolPayload:
 
 
 class _Worker:
-    def __init__(self) -> None:
+    def __init__(self, name: str = "seller-auto-browser") -> None:
         self._queue: queue.Queue[Any] = queue.Queue()
-        self._thread = threading.Thread(target=self._loop, name="seller-auto-browser", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
         self._thread.start()
 
     def _loop(self) -> None:
@@ -75,10 +87,13 @@ class _Worker:
             except Exception as exc:
                 slot.put((False, exc))
 
-    def call(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    def submit(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> queue.Queue[Any]:
         slot: queue.Queue[Any] = queue.Queue(maxsize=1)
         self._queue.put((function, args, kwargs, slot))
-        ok, value = slot.get()
+        return slot
+
+    def call(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        ok, value = self.submit(function, *args, **kwargs).get()
         if not ok:
             raise value
         return value
@@ -132,16 +147,22 @@ class SellerAutoService:
         settings: DelaySettings,
         output_dir: str | None = None,
         profile_dir: str | None = None,
+        workbook_path: str | None = None,
         headless: bool | None = None,
         worker: _Worker | None = None,
     ) -> None:
         self.settings = settings.validate()
         self.output_dir = Path(output_dir or settings.output_dir)
+        self.workbook_path = Path(workbook_path) if workbook_path else template_path()
         self.profile_dir = Path(profile_dir or settings.profile_dir)
         self.headless = settings.headless if headless is None else headless
         self.browser: ArgentinaBrowser | None = None
+        self.enrich_browser: ArgentinaBrowser | None = None
         self.state: dict[str, Any] | None = None
         self._worker = worker or _Worker()
+        self._enrich_worker = _Worker(name="seller-auto-enrich")
+        self._enrich_events: dict[str, threading.Event] = {}
+        self._state_lock = threading.Lock()
 
     def open_store(self, seller_id: str, product: str = "") -> ToolPayload:
         return self._guard(self._open_store, seller_id, product)
@@ -149,8 +170,8 @@ class SellerAutoService:
     def next_amazon_product(self) -> ToolPayload:
         return self._guard(self._next_amazon_product)
 
-    def set_keywords(self, product_id: str, keywords: str) -> ToolPayload:
-        return self._guard(self._set_keywords, product_id, keywords)
+    def set_keywords(self, product_id: str, keywords: str, chinese_name: str = "") -> ToolPayload:
+        return self._guard(self._set_keywords, product_id, keywords, chinese_name)
 
     def next_listing_batch(self) -> ToolPayload:
         return self._guard(self._next_listing_batch)
@@ -205,12 +226,32 @@ class SellerAutoService:
         return self.state
 
     def _save(self) -> None:
+        with self._state_lock:
+            self._write_state()
+
+    def _write_state(self) -> None:
         state = self._require_state()
         if self.browser is not None:
             state["challenge_pending"] = self.browser.challenge_pending
             state["challenge_site"] = self.browser.challenge_site
         state["updated_at"] = _now()
         atomic_write_json(state_path(self.output_dir, _storage_id(state)), state)
+
+    def close(self) -> None:
+        def close_browser(current: ArgentinaBrowser | None) -> None:
+            if current is not None:
+                current.close()
+
+        try:
+            self._worker.call(close_browser, self.browser)
+        except Exception:
+            log("关闭主浏览器失败")
+        self.browser = None
+        try:
+            self._enrich_worker.call(close_browser, self.enrich_browser)
+        except Exception:
+            log("关闭资料查询浏览器失败")
+        self.enrich_browser = None
 
     def _apply_challenge_flag(self) -> None:
         browser = self._ensure_browser()
@@ -299,6 +340,7 @@ class SellerAutoService:
         if path is None:
             return ToolPayload({"ok": False, "status": "error", "message": "没有找到这个会话"})
         self.state = load_json(path)
+        self._clear_prefetch_flags()
         self._ensure_browser()
         self._apply_challenge_flag()
         self._save()
@@ -316,17 +358,47 @@ class SellerAutoService:
         return self._payload({"ok": True, "status": "status"})
 
     def _export_results(self) -> ToolPayload:
+        self._wait_enrichment()
+        market_note = self._collect_market_quotes()
         state = self._require_state()
         payload = build_export(state)
-        path = seller_dir(self.output_dir, _storage_id(state)) / export_filename()
+        directory = seller_dir(self.output_dir, _storage_id(state))
+        path = directory / export_filename()
         atomic_write_json(path, payload)
-        if state.get("single_product"):
-            message = "这一条商品的结果已导出。不要再调用 next_amazon_product。"
+        workbook_path = self.workbook_path
+        products = [state["products"][product_id] for product_id in state.get("product_order", [])]
+        written = write_product_workbook(workbook_path, products)
+        removed = self._discard_finished_images()
+        if written:
+            if state.get("single_product"):
+                message = f"这一条商品的结果已追加到 {workbook_path}。不要再调用 next_amazon_product。"
+            elif state.get("amazon_done"):
+                message = f"店铺列表已遍历完，结果已追加到 {workbook_path}。"
+            else:
+                message = f"这是部分结果，已追加到 {workbook_path}。店铺还有未查看的商品，请继续 next_amazon_product，直到返回 end_of_store。"
+        elif state.get("single_product"):
+            message = "这一条没有同款，没有写入表格。不要再调用 next_amazon_product。"
         elif state.get("amazon_done"):
-            message = "店铺列表已遍历完，结果已导出。"
+            message = "店铺列表已遍历完，没有同款，没有写入表格。"
         else:
-            message = "这是部分结果。店铺还有未查看的商品，请继续 next_amazon_product，直到返回 end_of_store。"
-        return self._payload({"ok": True, "status": "exported", "path": str(path), "message": message})
+            message = "当前没有同款，没有写入表格。店铺还有未查看的商品，请继续 next_amazon_product，直到返回 end_of_store。"
+        if removed:
+            message = f"{message} 已删除过程图片 {removed} 个。"
+        if market_note:
+            message = f"{message} {market_note}"
+        return self._payload(
+            {"ok": True, "status": "exported", "path": str(path), "workbook": str(workbook_path), "message": message}
+        )
+
+    def _discard_finished_images(self) -> int:
+        try:
+            removed = discard_finished_images(self.output_dir)
+        except Exception as exc:
+            log(f"清理过程图片失败：{exc}")
+            return 0
+        if removed:
+            step("清理", f"已删除过程图片 {removed} 个")
+        return removed
 
     def _next_amazon_product(self) -> ToolPayload:
         state = self._require_state()
@@ -472,21 +544,33 @@ class SellerAutoService:
             "title": product["title"] or entry["text"],
             "brand": product["brand"],
             "image_path": image_path,
+            "image_url": product.get("image_url") or "",
             "keywords": "",
             "ml_search_url": "",
             "listing": _empty_listing(),
             "judged_ids": [],
             "checked_keys": [],
             "matches": [],
+            "package_size": None,
+            "source_price": None,
         }
         state["product_order"].append(key)
         state["current_product_id"] = key
         self._leave_amazon_detail(browser, opened_new_tab, state)
         self._save()
+        self._schedule_enrichment(key, product.get("image_url") or "")
         if state.get("single_product"):
-            message = "请根据主图给出西班牙语搜索关键词，然后调用 set_keywords。这是指定的一条商品，不要再调用 next_amazon_product。"
+            message = (
+                "请根据主图给出西班牙语搜索关键词，然后调用 set_keywords。"
+                "卖家精灵和货源查询已在后台并行开始，不要等它们。"
+                "这是指定的一条商品，不要再调用 next_amazon_product。"
+            )
         else:
-            message = "请根据主图给出西班牙语搜索关键词，然后调用 set_keywords。美客多流程结束后再调用 next_amazon_product。"
+            message = (
+                "请根据主图给出西班牙语搜索关键词，然后调用 set_keywords。"
+                "卖家精灵和货源查询已在后台并行开始，不要等它们。"
+                "美客多流程结束后再调用 next_amazon_product。"
+            )
         return self._payload(
             {
                 "ok": True,
@@ -500,18 +584,127 @@ class SellerAutoService:
             [(f"亚马逊主图 product_id={key}", image_path)],
         )
 
+    def _schedule_enrichment(self, product_id: str, image_url: str) -> None:
+        event = threading.Event()
+        self._enrich_events[product_id] = event
+        step("资料", f"{product_id} 的卖家精灵和货源查询已在后台开始，美客多比对可以同时进行")
+        self._enrich_worker.submit(self._run_enrichment, product_id, image_url, event)
+
+    def _wait_enrichment(self) -> None:
+        events = list(self._enrich_events.values())
+        if not events:
+            return
+        pending = [event for event in events if not event.is_set()]
+        if pending:
+            step("资料", "导出前等待卖家精灵和货源查询结束")
+        for event in events:
+            event.wait()
+
+    def _collect_market_quotes(self) -> str:
+        state = self._require_state()
+        jobs = []
+        for product_id in state.get("product_order", []):
+            product = state["products"].get(product_id) or {}
+            links = quote_links(product)
+            if not links:
+                continue
+            jobs.append({"product_id": product_id, "links": links, "package": product.get("package_size")})
+        if not jobs:
+            return ""
+        try:
+            return self._enrich_worker.call(self._run_market_quotes, jobs)
+        except Exception as exc:
+            step("蓝鲸", f"查询失败：{exc}")
+            log(traceback.format_exc())
+            return "蓝鲸选品没有查成，名称和 FBA 运费这次没写。"
+
+    def _run_market_quotes(self, jobs: list[dict[str, Any]]) -> str:
+        browser = self._ensure_enrich_browser()
+        quotes = collect_market_quotes(
+            browser,
+            [(job["links"], job.get("package")) for job in jobs],
+        )
+        wrote = False
+        state = self._require_state()
+        for job, quote in zip(jobs, quotes):
+            product = state["products"].get(job["product_id"])
+            if not product:
+                continue
+            if quote.get("orders") is not None:
+                product["market_orders"] = quote["orders"]
+                wrote = True
+            if quote.get("fba_fee") is not None:
+                product["fba_fee"] = quote["fba_fee"]
+                wrote = True
+        self._save()
+        if wrote:
+            return "蓝鲸选品已把 30 天销量写入名称，并把尾程运费写入 FBA 运费。"
+        return "蓝鲸选品没有查到这些链接，名称和 FBA 运费保持原样。"
+
+    def _ensure_enrich_browser(self) -> ArgentinaBrowser:
+        if self.enrich_browser is None:
+            enrich_dir = Path(str(self.profile_dir) + "-enrich")
+            self.enrich_browser = ArgentinaBrowser(self.settings, enrich_dir, headless=self.headless)
+        self.enrich_browser.start()
+        assert self.enrich_browser is not None
+        return self.enrich_browser
+
+    def _run_enrichment(self, product_id: str, image_url: str, event: threading.Event) -> None:
+        try:
+            browser = self._ensure_enrich_browser()
+            package = self._read_package_size(browser, product_id)
+            source = self._read_source_price(browser, image_url)
+            with self._state_lock:
+                if self.state and product_id in self.state.get("products", {}):
+                    self.state["products"][product_id]["package_size"] = package
+                    self.state["products"][product_id]["source_price"] = source
+                    self._write_state()
+            step("资料", f"{product_id} 包装和货源已写回")
+        except Exception as exc:
+            step("资料", f"{product_id} 后台查询失败：{exc}")
+            log(traceback.format_exc())
+        finally:
+            event.set()
+
+    def _read_package_size(self, browser: ArgentinaBrowser, asin: str) -> dict[str, str] | None:
+        try:
+            return read_package_size(browser, asin)
+        except Exception as exc:
+            step("卖家精灵", f"没有读到包装尺寸：{exc}")
+            log(traceback.format_exc())
+            try:
+                browser.close_detail()
+            except Exception:
+                log("关闭卖家精灵标签失败")
+            return None
+
+    def _read_source_price(self, browser: ArgentinaBrowser, image_url: str) -> dict[str, Any] | None:
+        try:
+            return read_source_average(browser, image_url)
+        except Exception as exc:
+            step("1688", f"没有读到货源均价：{exc}")
+            log(traceback.format_exc())
+            try:
+                browser.close_detail()
+            except Exception:
+                log("关闭1688标签失败")
+            return None
+
     def _leave_amazon_detail(self, browser: ArgentinaBrowser, opened_new_tab: bool, state: dict[str, Any]) -> None:
         if state.get("single_product"):
             browser.close_detail()
             return
         browser.finish_detail(opened_new_tab, state["list_url"])
 
-    def _set_keywords(self, product_id: str, keywords: str) -> ToolPayload:
+    def _set_keywords(self, product_id: str, keywords: str, chinese_name: str = "") -> ToolPayload:
         state = self._require_state()
         product = self._product(product_id)
         text = clean_keywords(keywords)
+        if chinese_name.strip():
+            product["chinese_name"] = chinese_name.strip()
         search_url = ml_search_url(text)
-        if product.get("keywords") != text:
+        fresh = product.get("keywords") != text
+        if fresh:
             product["keywords"] = text
             product["ml_search_url"] = search_url
             product["listing"] = _empty_listing()
@@ -526,19 +719,18 @@ class SellerAutoService:
             return self._blocked(blocked)
         browser.pause_ml_scroll()
         self._save()
-        return self._payload(
-            {
-                "ok": True,
-                "status": "keywords_ready",
-                "product_id": product_id,
-                "keywords": text,
-                "ml_search_url": search_url,
-                "message": "搜索页已打开。请调用 next_listing_batch 获取列表主图。",
-            }
-        )
+        payload = self._next_listing_batch()
+        payload.data["keywords"] = text
+        payload.data["ml_search_url"] = search_url
+        if fresh and payload.data.get("status") == "listing_batch":
+            payload.data["message"] = (
+                "搜索结果已打开。下面是第一批列表图。"
+                + self._compare_message("listing", payload.data.get("title_dropped") or [])
+            )
+        return payload
 
     def _next_listing_batch(self) -> ToolPayload:
-        state = self._require_state()
+        self._require_state()
         product = self._current_product()
         if not product.get("ml_search_url"):
             return self._payload({"ok": False, "status": "need_keywords", "message": "请先调用 set_keywords"})
@@ -555,12 +747,29 @@ class SellerAutoService:
             self._save()
         batch = self._take_candidates(product)
         if batch:
+            self._schedule_listing_prefetch(product)
             return self._candidate_payload(product, batch, "listing_batch")
         if listing["page2_done"]:
             message = "前两页已看完" if listing["candidates"] else "前两页没有找到商品主图"
             return self._payload(
                 {"ok": True, "status": "listing_complete", "product_id": product["product_id"], "message": message}
             )
+        blocked = self._load_listing_page2(product)
+        if blocked:
+            return blocked
+        batch = self._take_candidates(product)
+        if not batch:
+            message = "前两页已看完" if product["listing"]["candidates"] else "前两页没有找到商品主图"
+            return self._payload(
+                {"ok": True, "status": "listing_complete", "product_id": product["product_id"], "message": message}
+            )
+        return self._candidate_payload(product, batch, "listing_batch")
+
+    def _load_listing_page2(self, product: dict[str, Any]) -> ToolPayload | None:
+        listing = product["listing"]
+        if listing.get("page2_done"):
+            return None
+        browser = self._ensure_browser()
         browser.ml_cooldown.acquire()
         moved = open_next_results_page(browser.list_page, product["ml_search_url"])
         blocked = browser.ensure_clear(browser.list_page, "ml")
@@ -572,13 +781,50 @@ class SellerAutoService:
             self._add_candidates(product, cards, 2)
         listing["page2_done"] = True
         self._save()
-        batch = self._take_candidates(product)
-        if not batch:
-            message = "前两页已看完" if product["listing"]["candidates"] else "前两页没有找到商品主图"
-            return self._payload(
-                {"ok": True, "status": "listing_complete", "product_id": product["product_id"], "message": message}
-            )
-        return self._candidate_payload(product, batch, "listing_batch")
+        return None
+
+    def _schedule_listing_prefetch(self, product: dict[str, Any]) -> None:
+        listing = product["listing"]
+        if listing.get("page2_done") or listing.get("page2_prefetching") or not product.get("ml_search_url"):
+            return
+        listing["page2_prefetching"] = True
+        self._worker.submit(self._prefetch_listing_page2, product["product_id"])
+
+    def _prefetch_listing_page2(self, product_id: str) -> None:
+        listing: dict[str, Any] | None = None
+        try:
+            product = (self.state or {}).get("products", {}).get(product_id)
+            if not product:
+                return
+            listing = product.get("listing")
+            if not isinstance(listing, dict) or listing.get("page2_done") or not product.get("ml_search_url"):
+                return
+            step("预取", f"{product_id} 开始抓美客多列表第二页")
+            blocked = self._load_listing_page2(product)
+            if blocked:
+                step("预取", f"{product_id} 列表第二页需要手动验证")
+            else:
+                step("预取", f"{product_id} 列表第二页已写入，当前候选 {len(listing.get('candidates') or [])} 条")
+        except Exception as exc:
+            step("预取", f"{product_id} 列表第二页失败：{exc}")
+            log(traceback.format_exc())
+        finally:
+            if listing is not None:
+                listing["page2_prefetching"] = False
+                try:
+                    self._save()
+                except Exception:
+                    log("保存列表预取状态失败")
+
+    def _clear_prefetch_flags(self) -> None:
+        state = self.state
+        if not state:
+            return
+        for product in state.get("products", {}).values():
+            listing = product.get("listing")
+            if isinstance(listing, dict):
+                listing.pop("page2_prefetching", None)
+            product.pop("ad_prefetching", None)
 
     def _submit_listing_matches(self, matches: list[Any], model_name: str) -> ToolPayload:
         product = self._current_product()
@@ -601,56 +847,42 @@ class SellerAutoService:
 
     def _next_ad_batch(self, product_id: str) -> ToolPayload:
         product = self._product(product_id)
-        browser = self._ensure_browser()
         self._require_state()["current_product_id"] = product_id
         for match in product["matches"]:
             if match.get("source") != "search" or match.get("ads_complete"):
                 continue
             if not match.get("ads_scraped"):
-                page = self._open_ml_detail_with_retry(public_url(match["url"]))
-                if page is None:
-                    match["ad_candidates"] = []
-                    match["ad_next_index"] = 0
-                    match["ads_scraped"] = True
-                    match["ads_complete"] = True
-                    self._save()
-                    continue
-                blocked = browser.ensure_clear(page, "ml")
+                blocked = self._scrape_ad_match(product, match)
                 if blocked:
-                    return self._blocked(blocked)
-                page = browser.live_page(page)
-                browser.pause_ml_read()
-                cards = collect_ad_cards(page, browser.pause_ml_scroll)
-                log(f"广告位主图 {len(cards)} 张：{public_url(match['url'])}")
-                match["ad_candidates"] = self._ad_candidates(product, match, cards)
-                match["ad_next_index"] = 0
-                match["ads_scraped"] = True
-                browser.close_detail()
-                self._save()
+                    return blocked
+                if match.get("ads_complete"):
+                    continue
             start = int(match.get("ad_next_index") or 0)
-            batch = match["ad_candidates"][start : start + BATCH_SIZE]
-            if not batch:
+            batch, start, dropped = self._select_image_batch(product, match["ad_candidates"], start)
+            match["ad_next_index"] = start
+            if match["ad_next_index"] >= len(match["ad_candidates"]):
                 match["ads_complete"] = True
+            if not batch:
                 self._save()
                 continue
             self._ensure_candidate_files(batch, page_url=match["url"])
-            match["ad_next_index"] = start + len(batch)
-            if match["ad_next_index"] >= len(match["ad_candidates"]):
-                match["ads_complete"] = True
             self._save()
             images = [(f"参照图 美客多详情主图 parent_url={match['url']}", match.get("image_path") or "")]
             payload_items = []
             for candidate in batch:
                 payload_items.append(self._candidate_summary(candidate))
                 images.append((f"广告图 candidate_id={candidate['candidate_id']} url={candidate['url']}", candidate.get("image_path") or ""))
+            self._schedule_ad_prefetch(product)
             return self._payload(
                 {
                     "ok": True,
                     "status": "ad_batch",
                     "product_id": product["product_id"],
                     "parent_url": match["url"],
+                    "amazon_title": product.get("title") or "",
                     "candidates": payload_items,
-                    "message": "请把这一批广告图和参照图对比后，直接调用 submit_ad_matches。不要再调用 next_ad_batch。",
+                    "title_dropped": dropped,
+                    "message": self._compare_message("ad", dropped),
                 },
                 images,
             )
@@ -663,6 +895,71 @@ class SellerAutoService:
                 "message": message,
             }
         )
+
+    def _scrape_ad_match(self, product: dict[str, Any], match: dict[str, Any]) -> ToolPayload | None:
+        if match.get("ads_scraped"):
+            return None
+        browser = self._ensure_browser()
+        page = self._open_ml_detail_with_retry(public_url(match["url"]))
+        if page is None:
+            match["ad_candidates"] = []
+            match["ad_next_index"] = 0
+            match["ads_scraped"] = True
+            match["ads_complete"] = True
+            self._save()
+            return None
+        blocked = browser.ensure_clear(page, "ml")
+        if blocked:
+            return self._blocked(blocked)
+        page = browser.live_page(page)
+        browser.pause_ml_read()
+        cards = collect_ad_cards(page, browser.pause_ml_scroll)
+        log(f"广告位主图 {len(cards)} 张：{public_url(match['url'])}")
+        match["ad_candidates"] = self._ad_candidates(product, match, cards)
+        match["ad_next_index"] = 0
+        match["ads_scraped"] = True
+        browser.close_detail()
+        self._save()
+        return None
+
+    def _next_unscraped_ad_match(self, product: dict[str, Any]) -> dict[str, Any] | None:
+        for match in product.get("matches") or []:
+            if match.get("source") != "search" or match.get("ads_complete") or match.get("ads_scraped"):
+                continue
+            return match
+        return None
+
+    def _schedule_ad_prefetch(self, product: dict[str, Any]) -> None:
+        if product.get("ad_prefetching") or self._next_unscraped_ad_match(product) is None:
+            return
+        product["ad_prefetching"] = True
+        self._worker.submit(self._prefetch_next_ad, product["product_id"])
+
+    def _prefetch_next_ad(self, product_id: str) -> None:
+        product: dict[str, Any] | None = None
+        try:
+            product = (self.state or {}).get("products", {}).get(product_id)
+            if not product:
+                return
+            match = self._next_unscraped_ad_match(product)
+            if match is None:
+                return
+            step("预取", f"{product_id} 开始抓下一条广告位")
+            blocked = self._scrape_ad_match(product, match)
+            if blocked:
+                step("预取", f"{product_id} 广告位需要手动验证")
+            else:
+                step("预取", f"{product_id} 下一条广告位已写入 {len(match.get('ad_candidates') or [])} 张")
+        except Exception as exc:
+            step("预取", f"{product_id} 广告位预取失败：{exc}")
+            log(traceback.format_exc())
+        finally:
+            if product is not None:
+                product["ad_prefetching"] = False
+                try:
+                    self._save()
+                except Exception:
+                    log("保存广告预取状态失败")
 
     def _submit_ad_matches(self, matches: list[Any], model_name: str) -> ToolPayload:
         product = self._current_product()
@@ -709,7 +1006,16 @@ class SellerAutoService:
                 quiet_skips += 1
                 continue
             if action == "record":
-                self._remember_sale(product, candidate, item, source, parent_url, model_name, candidate.get("sales_text") or "")
+                self._remember_sale(
+                    product,
+                    candidate,
+                    item,
+                    source,
+                    parent_url,
+                    model_name,
+                    candidate.get("sales_text") or "",
+                    price=candidate.get("price"),
+                )
                 recorded.append(product["matches"][-1])
                 step("销量", f"卡片上已有销量，不打开详情 {candidate.get('sales_text') or ''} {public_url(candidate['url'])}")
                 continue
@@ -732,7 +1038,15 @@ class SellerAutoService:
                 continue
             image_path = self._download(hero_image_url(page), self._image_stem(candidate["key"]), hero_locator(page), page.url)
             self._remember_sale(
-                product, candidate, item, source, parent_url, model_name, sales["sales_text"], image_path
+                product,
+                candidate,
+                item,
+                source,
+                parent_url,
+                model_name,
+                sales["sales_text"],
+                image_path,
+                read_price(page) or candidate.get("price"),
             )
             recorded.append(product["matches"][-1])
             step("销量", f"有销量，已记录 {sales['sales_text']} {public_url(candidate['url'])}")
@@ -765,6 +1079,7 @@ class SellerAutoService:
         model_name: str,
         sales_text: str,
         image_path: str | None = None,
+        price: float | None = None,
     ) -> None:
         if not image_path:
             self._ensure_candidate_files([candidate], page_url=candidate.get("url") or "")
@@ -778,6 +1093,7 @@ class SellerAutoService:
                 "key": candidate["key"],
                 "title": candidate.get("title") or "",
                 "sales_text": sales_text,
+                "price": price if price is not None else candidate.get("price"),
                 "confidence": item["confidence"],
                 "reason": item["reason"],
                 "source": source,
@@ -801,7 +1117,10 @@ class SellerAutoService:
         if step_name == "next_listing_batch":
             follow = self._next_listing_batch()
             if follow.data.get("status") == "listing_batch":
-                follow.data["message"] = "上一批销量已处理。下面是下一批列表图，请直接 submit_listing_matches，不要再调用 next_listing_batch。"
+                follow.data["message"] = (
+                    "上一批销量已处理。下面是下一批列表图。"
+                    + self._compare_message("listing", follow.data.get("title_dropped") or [])
+                )
                 return follow
             payload = follow
             data = payload.data
@@ -809,7 +1128,10 @@ class SellerAutoService:
         if step_name == "next_ad_batch" and product_id:
             follow = self._next_ad_batch(product_id)
             if follow.data.get("status") == "ad_batch":
-                follow.data["message"] = "下面是下一条有销量详情的广告图，请直接 submit_ad_matches，不要再调用 next_ad_batch。"
+                follow.data["message"] = (
+                    "下面是下一条有销量详情的广告图。"
+                    + self._compare_message("ad", follow.data.get("title_dropped") or [])
+                )
                 return follow
             return follow
         data["message"] = self._step_message(str(data.get("message") or ""), str(data.get("next_step") or ""))
@@ -917,6 +1239,7 @@ class SellerAutoService:
                     "image_path": "",
                     "title": card["title"],
                     "sales_text": card.get("sales_text") or "",
+                    "price": card.get("price"),
                     "key": card["key"],
                     "page": page_no,
                     "parent_url": "",
@@ -926,14 +1249,62 @@ class SellerAutoService:
 
     def _take_candidates(self, product: dict[str, Any]) -> list[dict[str, Any]]:
         listing = product["listing"]
-        start = int(listing["next_index"])
-        batch = listing["candidates"][start : start + BATCH_SIZE]
-        if not batch:
-            return []
-        self._ensure_candidate_files(batch, page_url=product["ml_search_url"])
-        listing["next_index"] = start + len(batch)
+        batch, next_index, dropped = self._select_image_batch(
+            product, listing["candidates"], int(listing["next_index"])
+        )
+        listing["next_index"] = next_index
+        listing["title_dropped"] = dropped
+        if batch:
+            self._ensure_candidate_files(batch, page_url=product["ml_search_url"])
         self._save()
         return batch
+
+    def _select_image_batch(
+        self,
+        product: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        start: int,
+    ) -> tuple[list[dict[str, Any]], int, list[dict[str, str]]]:
+        """跳过标题明显不是同一商品的候选，只把剩下的送去看图。"""
+
+        batch: list[dict[str, Any]] = []
+        dropped: list[dict[str, str]] = []
+        index = start
+        amazon_title = str(product.get("title") or "")
+        extra = str(product.get("keywords") or "")
+        while index < len(candidates) and len(batch) < BATCH_SIZE:
+            candidate = candidates[index]
+            index += 1
+            if title_obviously_different(amazon_title, str(candidate.get("title") or ""), extra):
+                self._reject_title_mismatch(product, candidate)
+                dropped.append(
+                    {
+                        "candidate_id": candidate["candidate_id"],
+                        "title": str(candidate.get("title") or ""),
+                        "reason": TITLE_MISMATCH_REASON,
+                    }
+                )
+                continue
+            batch.append(candidate)
+        return batch, index, dropped
+
+    def _reject_title_mismatch(self, product: dict[str, Any], candidate: dict[str, Any]) -> None:
+        candidate["similar"] = False
+        candidate["similarity"] = 1
+        candidate["reason"] = TITLE_MISMATCH_REASON
+        candidate["model_name"] = TITLE_FILTER_MODEL
+        self._remember_judged(product, candidate["candidate_id"])
+        step("标题", f"{TITLE_MISMATCH_REASON} {candidate.get('title') or ''} {public_url(candidate.get('url') or '')}")
+
+    def _compare_message(self, kind: str, dropped: list[Any]) -> str:
+        submit = "submit_listing_matches" if kind == "listing" else "submit_ad_matches"
+        skipped = f"已按标题跳过 {len(dropped)} 条明显不是同一商品的，这些没有进入看图。" if dropped else ""
+        return (
+            f"{skipped}请先对照亚马逊标题再看剩下的候选标题。"
+            "标题已经能明显看出不是同一商品的，直接记 similar=false，不要进图片对比。"
+            "剩下的再看图：颜色不同也可以算同款；外形、结构和整体构图高度相似则为 true，外形明显不同才是 false。"
+            f"判断完再调用 {submit}。"
+        )
 
     def _candidate_payload(self, product: dict[str, Any], batch: list[dict[str, Any]], status: str) -> ToolPayload:
         reference = product.get("image_path") or ""
@@ -944,13 +1315,16 @@ class SellerAutoService:
             images.append(
                 (f"列表图 candidate_id={candidate['candidate_id']} url={candidate['url']}", candidate.get("image_path") or "")
             )
+        dropped = list(product.get("listing", {}).get("title_dropped") or [])
         return self._payload(
             {
                 "ok": True,
                 "status": status,
                 "product_id": product["product_id"],
+                "amazon_title": product.get("title") or "",
                 "candidates": summaries,
-                "message": "请对比这一批列表图和亚马逊参照图后，直接调用 submit_listing_matches。不要再调用 next_listing_batch。未判断完不要把它们当成同款。",
+                "title_dropped": dropped,
+                "message": self._compare_message("listing", dropped),
             },
             images,
         )
@@ -972,6 +1346,7 @@ class SellerAutoService:
                     "image_path": "",
                     "title": card["title"],
                     "sales_text": card.get("sales_text") or "",
+                    "price": card.get("price"),
                     "key": card["key"],
                     "parent_url": match["url"],
                 }

@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from seller_auto.progress import next_required_step
+from seller_auto.sales import sales_count
+
+_EXPORT_JSON = re.compile(r"^\d{8}-\d{6}\.json$")
+
 
 def seller_dir(output_dir: Path, seller_id: str) -> Path:
     path = output_dir / seller_id
@@ -57,7 +62,7 @@ def public_url(url: str, item_key: str = "") -> str:
 
 
 def similarity_rows(product: dict[str, Any]) -> list[dict[str, Any]]:
-    """只对已经通过相似和销量筛选的同款按相似度排名。"""
+    """只对已经通过相似和销量筛选的同款按销量倒序，销量相同再看相似度。"""
 
     rows = []
     for match in product.get("matches") or []:
@@ -71,10 +76,17 @@ def similarity_rows(product: dict[str, Any]) -> list[dict[str, Any]]:
                 "similarity": match.get("confidence"),
                 "reason": match.get("reason") or "",
                 "sales_text": match.get("sales_text") or "",
+                "price": match.get("price"),
                 "source": match.get("source"),
             }
         )
-    rows.sort(key=lambda row: (-float(row["similarity"]), str(row.get("candidate_id") or row.get("url") or "")))
+    rows.sort(
+        key=lambda row: (
+            -sales_count(str(row.get("sales_text") or "")),
+            -float(row["similarity"] or 0),
+            str(row.get("candidate_id") or row.get("url") or ""),
+        )
+    )
     return rows
 
 
@@ -93,6 +105,7 @@ def build_export(state: dict[str, Any]) -> dict[str, Any]:
                     "candidate_id": item.get("candidate_id"),
                     "url": public_url(str(item.get("url") or ""), str(item.get("key") or "")),
                     "sales_text": item.get("sales_text"),
+                    "price": item.get("price"),
                     "similarity": item.get("confidence"),
                     "reason": item.get("reason") or "",
                     "source": item.get("source"),
@@ -102,14 +115,25 @@ def build_export(state: dict[str, Any]) -> dict[str, Any]:
                     "title": item.get("title") or "",
                 }
             )
-        matches.sort(key=lambda row: (-float(row["similarity"] or 0), str(row.get("candidate_id") or row.get("url") or "")))
+        matches.sort(
+            key=lambda row: (
+                -sales_count(str(row.get("sales_text") or "")),
+                -float(row["similarity"] or 0),
+                str(row.get("candidate_id") or row.get("url") or ""),
+            )
+        )
         products.append(
             {
                 "product_id": product_id,
                 "url": product.get("url"),
                 "title": product.get("title"),
                 "brand": product.get("brand") or "",
+                "package_size": product.get("package_size"),
+                "source_price": product.get("source_price"),
                 "keywords": product.get("keywords") or "",
+                "chinese_name": product.get("chinese_name") or "",
+                "market_orders": product.get("market_orders"),
+                "fba_fee": product.get("fba_fee"),
                 "image_path": product.get("image_path"),
                 "ml_search_url": product.get("ml_search_url"),
                 "mercadolibre_matches": matches,
@@ -124,6 +148,44 @@ def build_export(state: dict[str, Any]) -> dict[str, Any]:
         "model_names": model_names,
         "products": products,
     }
+
+
+def discard_images(run_dir: Path) -> int:
+    """删掉一轮里的过程图片。表格已经嵌进主图，状态和导出 JSON 留着。"""
+
+    images = run_dir / "images"
+    if not images.is_dir():
+        return 0
+    removed = 0
+    for path in list(images.iterdir()):
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            removed += 1
+    try:
+        images.rmdir()
+    except OSError:
+        pass
+    return removed
+
+
+def discard_finished_images(output_dir: Path) -> int:
+    """已经导出、并且这条流程不再需要看图时，清掉过程图片。"""
+
+    if not output_dir.is_dir():
+        return 0
+    removed = 0
+    for state_file in output_dir.glob("**/state.json"):
+        try:
+            state = load_json(state_file)
+        except (OSError, json.JSONDecodeError):
+            continue
+        run_dir = state_file.parent
+        if next_required_step(state) != "export_results":
+            continue
+        if not any(_EXPORT_JSON.fullmatch(item.name) for item in run_dir.glob("*.json")):
+            continue
+        removed += discard_images(run_dir)
+    return removed
 
 
 def export_filename(now: datetime | None = None) -> str:

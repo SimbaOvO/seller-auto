@@ -2,7 +2,10 @@
   "mcpServers": {
     "seller-auto": {
       "command": ".venv/bin/python",
-      "args": ["-m", "seller_auto.mcp_server"]
+      "args": ["-m", "seller_auto.mcp_server"],
+      "env": {
+        "SELLER_AUTO_MCP_REV": "title-prefilter"
+      }
     }
   }
 }

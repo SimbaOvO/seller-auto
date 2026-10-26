@@ -1,3 +1,4 @@
 mcp>=2.3,<3
 playwright>=1.48
 pillow>=10
+openpyxl>=3.1

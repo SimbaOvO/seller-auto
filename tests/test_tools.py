@@ -9,7 +9,13 @@ from seller_auto.browser import pages_to_close
 from seller_auto.mcp_server import INSTRUCTIONS, _blocks, build_server
 from seller_auto.pacing import DelaySettings
 from seller_auto.service import SellerAutoService, ToolPayload
-from seller_auto.storage import atomic_write_json, build_export, find_state_by_session, load_json
+from seller_auto.storage import (
+    atomic_write_json,
+    build_export,
+    discard_finished_images,
+    find_state_by_session,
+    load_json,
+)
 
 
 class ToolContractTests(unittest.TestCase):
@@ -19,6 +25,7 @@ class ToolContractTests(unittest.TestCase):
         self.assertEqual(
             set(tools),
             {
+                "open_product",
                 "open_store",
                 "next_amazon_product",
                 "set_keywords",
@@ -40,9 +47,15 @@ class ToolContractTests(unittest.TestCase):
         self.assertIn("seller_id", open_store["properties"])
         self.assertNotIn("url", open_store["properties"])
         self.assertIn("seller_id", open_store["required"])
-        self.assertIn("open_store(seller_id, product)", INSTRUCTIONS)
+        self.assertIn("open_product", INSTRUCTIONS)
+        product_schema = tools["open_product"].parameters
+        self.assertEqual(set(product_schema["required"]), {"seller_id", "product"})
         self.assertIn("颜色", INSTRUCTIONS)
         self.assertIn("高度相似", INSTRUCTIONS)
+        self.assertIn("并行", INSTRUCTIONS)
+        self.assertIn("标题", INSTRUCTIONS)
+        self.assertIn("不要进图片对比", INSTRUCTIONS)
+        self.assertIn("chinese_name", tools["set_keywords"].parameters["properties"])
         self.assertIn(INSTRUCTIONS, server.instructions or "")
 
     def test_image_blocks_stay_images(self) -> None:
@@ -81,7 +94,17 @@ class StorageTests(unittest.TestCase):
                     "url": "https://www.amazon.com.mx/dp/B0C1234567",
                     "title": "Funda",
                     "brand": "ACER",
+                    "package_size": {
+                        "length": "23.6",
+                        "width": "16.3",
+                        "height": "7.1",
+                        "unit": "cm",
+                        "weight": "454",
+                        "weight_unit": "g",
+                    },
+                    "source_price": {"average": "12.35", "currency": "CNY", "count": 10},
                     "keywords": "funda para burro de planchar",
+                    "chinese_name": "烫衣板套",
                     "image_path": "images/B0C1234567.jpg",
                     "ml_search_url": "https://listado.mercadolibre.com.ar/funda",
                     "listing": {
@@ -136,6 +159,13 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(exported["products"][0]["mercadolibre_matches"][0]["source"], "search")
         self.assertEqual(exported["products"][0]["mercadolibre_matches"][0]["candidate_id"], "sold-high")
         self.assertEqual(exported["products"][0]["mercadolibre_matches"][0]["similarity"], 0.96)
+        self.assertEqual(exported["products"][0]["package_size"]["length"], "23.6")
+        self.assertEqual(exported["products"][0]["package_size"]["width"], "16.3")
+        self.assertEqual(exported["products"][0]["package_size"]["height"], "7.1")
+        self.assertEqual(exported["products"][0]["package_size"]["weight"], "454")
+        self.assertEqual(exported["products"][0]["package_size"]["weight_unit"], "g")
+        self.assertEqual(exported["products"][0]["source_price"]["average"], "12.35")
+        self.assertEqual(exported["products"][0]["chinese_name"], "烫衣板套")
         self.assertEqual(exported["products"][0]["top_links"][0]["candidate_id"], "sold-high")
         self.assertEqual([item["candidate_id"] for item in exported["products"][0]["top_links"]], ["sold-high", "sold-low"])
         self.assertNotIn("tracking", exported["products"][0]["top_links"][1]["url"])
@@ -149,6 +179,39 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(load_json(path)["session_id"], "sess-1")
             self.assertEqual(find_state_by_session(root, "sess-1"), path)
             self.assertIsNone(find_state_by_session(root, "missing"))
+
+    def test_finished_export_drops_images_and_keeps_an_open_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            done = self._run(root / "seller" / "run-done", amazon_done=True, export=True)
+            pending = self._run(root / "seller" / "run-open", amazon_done=False, export=True)
+            ready = self._run(root / "seller" / "run-ready", amazon_done=True, export=False)
+            removed = discard_finished_images(root)
+            self.assertEqual(removed, 1)
+            self.assertFalse((done / "images" / "hero.jpg").exists())
+            self.assertFalse((done / "images").exists())
+            self.assertTrue((done / "state.json").is_file())
+            self.assertTrue((done / "20261026-120000.json").is_file())
+            self.assertTrue((pending / "images" / "hero.jpg").is_file())
+            self.assertTrue((ready / "images" / "hero.jpg").is_file())
+
+    def _run(self, run_dir: Path, amazon_done: bool, export: bool) -> Path:
+        run_dir.mkdir(parents=True)
+        images = run_dir / "images"
+        images.mkdir()
+        (images / "hero.jpg").write_bytes(b"jpg")
+        atomic_write_json(
+            run_dir / "state.json",
+            {
+                "amazon_done": amazon_done,
+                "single_product": "",
+                "current_product_id": None,
+                "products": {},
+            },
+        )
+        if export:
+            (run_dir / "20261026-120000.json").write_text("{}", encoding="utf-8")
+        return run_dir
 
 
 class TabTests(unittest.TestCase):

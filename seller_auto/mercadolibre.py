@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from seller_auto.sales import has_sales
@@ -65,6 +66,7 @@ CARD_SCRIPT = """
     if (!title) title = el.getAttribute('alt') || '';
     const src = el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src') || '';
     let sales = '';
+    let price = '';
     if (card) {
       const sold = card.querySelector(
         '.poly-component__sold-quantity, .ui-search-item__group__element--sold, [class*="sold-quantity"]'
@@ -74,12 +76,25 @@ CARD_SCRIPT = """
         const found = (card.innerText || '').match(/\\+?\\d[\\d.]*\\s*vendidos?/i);
         sales = found ? found[0] : '';
       }
+      const amount = card.querySelector(
+        '.andes-money-amount:not(.andes-money-amount--previous) .andes-money-amount__fraction, .poly-price__current .andes-money-amount__fraction'
+      );
+      const cents = card.querySelector(
+        '.andes-money-amount:not(.andes-money-amount--previous) .andes-money-amount__cents, .poly-price__current .andes-money-amount__cents'
+      );
+      if (amount) {
+        price = (amount.textContent || '').trim();
+        if (cents && (cents.textContent || '').trim()) {
+          price += ',' + (cents.textContent || '').trim();
+        }
+      }
     }
     return {
       href,
       src,
       title: (title || '').replace(/\\s+/g, ' ').trim(),
       sales: (sales || '').replace(/\\s+/g, ' ').trim(),
+      price: (price || '').replace(/\\s+/g, ' ').trim(),
     };
   });
 }
@@ -96,6 +111,53 @@ def read_sales_text(page: Any) -> str:
 def sales_from_text(text: str) -> dict[str, Any]:
     cleaned = " ".join((text or "").split())
     return {"sales_text": cleaned, "has_sales": has_sales(cleaned)}
+
+
+def parse_price(text: str) -> float | None:
+    """读美客多阿根廷标价。12.345 是一万二千，12.345,50 带小数。"""
+
+    cleaned = re.sub(r"[^\d.,]", "", text or "")
+    if not cleaned:
+        return None
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "," in cleaned:
+        cleaned = cleaned.replace(",", ".")
+    elif cleaned.count(".") > 1:
+        cleaned = cleaned.replace(".", "")
+    elif cleaned.count(".") == 1:
+        whole, fraction = cleaned.split(".")
+        if len(fraction) == 3:
+            cleaned = whole + fraction
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def read_price(page: Any) -> float | None:
+    specific = page.locator(
+        ".ui-pdp-price .andes-money-amount:not(.andes-money-amount--previous) .andes-money-amount__fraction"
+    )
+    text = _text(specific) if specific.count() > 0 else ""
+    if not text:
+        text = _text(page.locator("meta[itemprop='price']"))
+    if not text:
+        try:
+            content = page.locator("meta[itemprop='price']").first.get_attribute("content")
+            text = content or ""
+        except Exception:
+            text = ""
+    if not text:
+        text = _text(page.locator(".andes-money-amount__fraction"))
+    cents = _text(
+        page.locator(
+            ".ui-pdp-price .andes-money-amount:not(.andes-money-amount--previous) .andes-money-amount__cents"
+        )
+    )
+    if text and cents:
+        text = f"{text},{cents}"
+    return parse_price(text)
 
 
 def hero_locator(page: Any) -> Any:
@@ -294,6 +356,7 @@ def _dedupe_cards(raw_cards: list[dict[str, Any]], base_url: str) -> list[dict[s
                 "image_url": image,
                 "title": str(raw.get("title") or "").strip(),
                 "sales_text": " ".join(str(raw.get("sales") or "").split()),
+                "price": parse_price(str(raw.get("price") or "")),
                 "key": key,
             }
         )

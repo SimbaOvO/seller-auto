@@ -1,8 +1,88 @@
-"""客户端提交的同款判断。"""
+"""客户端提交的同款判断，以及进看图前的标题预筛。"""
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any
+
+TITLE_MISMATCH_REASON = "标题明显不是同一商品"
+TITLE_FILTER_MODEL = "title-filter"
+
+_STOPWORDS = {
+    "a",
+    "al",
+    "and",
+    "con",
+    "de",
+    "del",
+    "e",
+    "el",
+    "en",
+    "for",
+    "la",
+    "las",
+    "los",
+    "o",
+    "of",
+    "para",
+    "por",
+    "que",
+    "sin",
+    "su",
+    "sus",
+    "the",
+    "un",
+    "una",
+    "unas",
+    "unos",
+    "with",
+    "y",
+}
+
+_NOISE = {
+    "azul",
+    "blanco",
+    "blanca",
+    "calidad",
+    "cm",
+    "color",
+    "colores",
+    "combo",
+    "envio",
+    "estilo",
+    "gratis",
+    "gris",
+    "kit",
+    "marca",
+    "ml",
+    "mm",
+    "modelo",
+    "negro",
+    "negra",
+    "nueva",
+    "nuevo",
+    "oferta",
+    "original",
+    "pack",
+    "par",
+    "pares",
+    "pcs",
+    "pieza",
+    "piezas",
+    "premium",
+    "profesional",
+    "promocion",
+    "roja",
+    "rojo",
+    "rosa",
+    "set",
+    "talla",
+    "tipo",
+    "unidad",
+    "unidades",
+    "verde",
+}
 
 
 class MatchInputError(ValueError):
@@ -55,3 +135,46 @@ def filter_matches(matches: list[Any], threshold: float) -> tuple[list[dict[str,
         else:
             dropped.append(item)
     return kept, dropped
+
+
+def title_tokens(*parts: str) -> set[str]:
+    folded = _fold(" ".join(part for part in parts if part))
+    tokens: set[str] = set()
+    for item in re.findall(r"[a-z]+", folded):
+        if item in _STOPWORDS or item in _NOISE or len(item) < 3:
+            continue
+        tokens.add(_stem(item))
+    return tokens
+
+
+def title_obviously_different(amazon_title: str, candidate_title: str, extra: str = "") -> bool:
+    """只有两边有效词完全对不上时才算明显不是同一商品。标题空着或拿不准的留给看图。"""
+
+    amazon = title_tokens(amazon_title, extra)
+    candidate = title_tokens(candidate_title)
+    if not amazon or len(candidate) < 2:
+        return False
+    return not _tokens_related(amazon, candidate)
+
+
+def _fold(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    return "".join(char for char in normalized if not unicodedata.combining(char)).casefold()
+
+
+def _stem(token: str) -> str:
+    if len(token) > 5 and token.endswith("es"):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def _tokens_related(left: set[str], right: set[str]) -> bool:
+    if left & right:
+        return True
+    for first in left:
+        for second in right:
+            if len(first) >= 4 and len(second) >= 4 and (first.startswith(second) or second.startswith(first)):
+                return True
+    return False
