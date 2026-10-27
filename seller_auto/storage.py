@@ -150,6 +150,42 @@ def build_export(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def discard_product_images(product: dict[str, Any]) -> int:
+    """删掉这一条 ASIN 已经写入表格后不再需要的过程图片。"""
+
+    removed = 0
+    parents: set[Path] = set()
+    for path in _product_image_paths(product):
+        if not path.is_symlink() and not path.is_file():
+            continue
+        path.unlink()
+        removed += 1
+        parents.add(path.parent)
+    for parent in parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
+def _product_image_paths(product: dict[str, Any]) -> list[Path]:
+    values = [product.get("image_path")]
+    listing = product.get("listing") or {}
+    for candidate in listing.get("candidates") or []:
+        values.append(candidate.get("image_path"))
+    for match in product.get("matches") or []:
+        values.append(match.get("image_path"))
+        for candidate in match.get("ad_candidates") or []:
+            values.append(candidate.get("image_path"))
+    paths: list[Path] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in {str(path) for path in paths}:
+            paths.append(Path(text))
+    return paths
+
+
 def discard_images(run_dir: Path) -> int:
     """删掉一轮里的过程图片。表格已经嵌进主图，状态和导出 JSON 留着。"""
 

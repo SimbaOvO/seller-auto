@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from seller_auto.service import ToolPayload
 ROOT = Path(__file__).resolve().parent.parent
 SOCKET_PATH = ROOT / "data" / "seller-auto.sock"
 PID_PATH = ROOT / "data" / "seller-auto.pid"
+CODE_REVISION = "mcp-submit-followup"
 
 
 def encode_message(payload: dict) -> bytes:
@@ -76,10 +78,57 @@ def _ping() -> bool:
         return False
 
 
+def _revision() -> str:
+    if not SOCKET_PATH.exists():
+        return ""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1)
+            client.connect(str(SOCKET_PATH))
+            client.sendall(encode_message({"method": "revision", "params": {}}))
+            reply = read_message(client)
+        return str(reply.get("revision") or "")
+    except (OSError, ConnectionError, json.JSONDecodeError, TimeoutError, ValueError):
+        return ""
+
+
+def _stop_daemon() -> None:
+    pid = 0
+    if PID_PATH.exists():
+        try:
+            pid = int(PID_PATH.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pid = 0
+    if pid and _pid_alive(pid):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pid = 0
+        for _ in range(50):
+            if not pid or not _pid_alive(pid):
+                break
+            time.sleep(0.1)
+        if pid and _pid_alive(pid):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+    PID_PATH.unlink(missing_ok=True)
+    SOCKET_PATH.unlink(missing_ok=True)
+
+
 def ensure_daemon() -> None:
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     if _ping():
-        return
+        if _revision() == CODE_REVISION:
+            return
+        _stop_daemon()
     _clear_stale()
     log_file = ROOT / "logs" / "seller-auto.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)

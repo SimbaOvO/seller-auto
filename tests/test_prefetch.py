@@ -74,6 +74,48 @@ class PrefetchTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.directory.cleanup()
 
+    def _stub_detail(self, sales_by_url: dict[str, str]) -> list[str]:
+        opened: list[str] = []
+
+        class _Page:
+            def __init__(self, url: str) -> None:
+                self.url = url
+
+        browser = _Browser()
+        browser.open_detail = lambda url: opened.append(url) or _Page(url)
+        browser.live_page = lambda page: page
+        browser.pause_ml_read = lambda: None
+        browser.pause_ml_scroll = lambda: None
+        browser.ensure_clear = lambda page, site: None
+        self.service._ensure_browser = lambda: browser
+        self.service._download = lambda *args, **kwargs: ""
+        self.service._fill_listing_ads = lambda product, match, page: None
+
+        import seller_auto.service as service_mod
+
+        self._service_mod = service_mod
+        self._original_sales_readers = (
+            service_mod.read_sales_text,
+            service_mod.sales_from_text,
+            service_mod.hero_image_url,
+            service_mod.hero_locator,
+            service_mod.read_price,
+        )
+        service_mod.read_sales_text = lambda page: sales_by_url.get(page.url, "")
+        service_mod.sales_from_text = lambda text: {"has_sales": bool(text), "sales_text": text}
+        service_mod.hero_image_url = lambda page: ""
+        service_mod.hero_locator = lambda page: None
+        service_mod.read_price = lambda page: None
+        return opened
+
+    def _restore_sales_readers(self) -> None:
+        read_sales, from_text, hero, locator, price = self._original_sales_readers
+        self._service_mod.read_sales_text = read_sales
+        self._service_mod.sales_from_text = from_text
+        self._service_mod.hero_image_url = hero
+        self._service_mod.hero_locator = locator
+        self._service_mod.read_price = price
+
     def test_set_keywords_returns_the_first_listing_batch(self) -> None:
         product = self.service.state["products"]["B07LCLQ47D"]
         product["keywords"] = ""
@@ -135,7 +177,9 @@ class PrefetchTests(unittest.TestCase):
         self.assertEqual(next_required_step(self.service.state), "submit_listing_matches")
 
     def test_ready_page2_does_not_navigate_again(self) -> None:
-        listing = self.service.state["products"]["B07LCLQ47D"]["listing"]
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["judged_ids"] = ["c1"]
+        listing = product["listing"]
         listing["page2_done"] = True
         listing["next_index"] = 1
         listing["candidates"].append(
@@ -156,7 +200,9 @@ class PrefetchTests(unittest.TestCase):
         self.assertEqual(payload.data["candidates"][0]["candidate_id"], "c2")
 
     def test_exhausted_page1_loads_page2_before_returning(self) -> None:
-        listing = self.service.state["products"]["B07LCLQ47D"]["listing"]
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["judged_ids"] = ["c1"]
+        listing = product["listing"]
         listing["next_index"] = 1
 
         def fake_load(product: dict) -> None:
@@ -181,6 +227,7 @@ class PrefetchTests(unittest.TestCase):
         product = self.service.state["products"]["B07LCLQ47D"]
         product["listing"]["page2_done"] = True
         product["listing"]["next_index"] = 1
+        product["judged_ids"] = ["c1"]
         product["matches"] = [
             {
                 "source": "search",
@@ -324,6 +371,229 @@ class PrefetchTests(unittest.TestCase):
         self.assertEqual(downloaded, ["ad-keep"])
         self.assertIn("ad-phone", product["judged_ids"])
         self.assertTrue(product["matches"][0]["ads_complete"])
+
+    def test_listing_below_top_ten_is_skipped(self) -> None:
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["matches"] = [
+            {
+                "url": f"https://articulo.mercadolibre.com.ar/MLA-{index}",
+                "key": f"MLA{index}",
+                "sales_text": "+100 vendidos",
+                "source": "search",
+                "ads_scraped": False,
+                "ads_complete": False,
+                "ad_candidates": [],
+                "ad_next_index": 0,
+                "candidate_id": f"old-{index}",
+            }
+            for index in range(10)
+        ]
+        product["listing"]["candidates"].append(
+            {
+                "candidate_id": "low-new",
+                "url": "https://articulo.mercadolibre.com.ar/MLA-low",
+                "title": "Cubierta para estufa",
+                "sales_text": "+5 vendidos",
+                "key": "MLALOW",
+                "similar": True,
+                "similarity": 0.9,
+            }
+        )
+        product["listing"]["candidates"].append(
+            {
+                "candidate_id": "high-new",
+                "url": "https://articulo.mercadolibre.com.ar/MLA-high",
+                "title": "Cubierta para estufa",
+                "sales_text": "+500 vendidos",
+                "key": "MLAHIGH",
+                "similar": True,
+                "similarity": 0.9,
+            }
+        )
+        self.service._ensure_candidate_files = lambda candidates, page_url: None
+        opened = self._stub_detail(
+            {
+                "https://articulo.mercadolibre.com.ar/MLA-high": "+500 vendidos",
+            }
+        )
+        try:
+            payload = self.service._open_judged_matches(
+                product,
+                [
+                    {"candidate_id": "low-new", "similar": True, "confidence": 0.9, "reason": "同款"},
+                    {"candidate_id": "high-new", "similar": True, "confidence": 0.9, "reason": "同款"},
+                ],
+                "cursor-grok-4.5-low-fast",
+                "search",
+                None,
+            )
+        finally:
+            self._restore_sales_readers()
+        self.assertEqual(opened, ["https://articulo.mercadolibre.com.ar/MLA-high"])
+        self.assertIn("low-new", payload.data["skipped"])
+        self.assertNotIn("MLALOW", [item["key"] for item in product["matches"]])
+        self.assertIn("MLAHIGH", [item["key"] for item in product["matches"]])
+
+    def test_ad_card_sales_skip_detail_and_below_top_ten(self) -> None:
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["matches"] = [
+            {
+                "url": f"https://articulo.mercadolibre.com.ar/MLA-{index}",
+                "key": f"MLA{index}",
+                "sales_text": "+100 vendidos",
+                "source": "search",
+                "ads_scraped": False,
+                "ads_complete": False,
+                "ad_candidates": [],
+                "candidate_id": f"old-{index}",
+            }
+            for index in range(10)
+        ]
+        product["matches"][0]["ad_candidates"] = [
+            {
+                "candidate_id": "ad-low",
+                "url": "https://articulo.mercadolibre.com.ar/MLA-ad-low",
+                "title": "Cubierta para estufa",
+                "sales_text": "+5 vendidos",
+                "key": "MLAADLOW",
+                "similar": True,
+                "similarity": 0.9,
+            },
+            {
+                "candidate_id": "ad-high",
+                "url": "https://articulo.mercadolibre.com.ar/MLA-ad-high",
+                "title": "Cubierta para estufa",
+                "sales_text": "+500 vendidos",
+                "key": "MLAADHIGH",
+                "similar": True,
+                "similarity": 0.9,
+            },
+        ]
+        self.service._ensure_candidate_files = lambda candidates, page_url: None
+        opened = self._stub_detail(
+            {
+                "https://articulo.mercadolibre.com.ar/MLA-ad-low": "+5 vendidos",
+                "https://articulo.mercadolibre.com.ar/MLA-ad-high": "+500 vendidos",
+            }
+        )
+        try:
+            payload = self.service._open_judged_matches(
+                product,
+                [
+                    {"candidate_id": "ad-low", "similar": True, "confidence": 0.9, "reason": "同款"},
+                    {"candidate_id": "ad-high", "similar": True, "confidence": 0.9, "reason": "同款"},
+                ],
+                "cursor-grok-4.5-low-fast",
+                "recommendation",
+                "",
+            )
+        finally:
+            self._restore_sales_readers()
+        self.assertEqual(opened, [])
+        self.assertIn("ad-low", payload.data["skipped"])
+        self.assertNotIn("MLAADLOW", [item["key"] for item in product["matches"]])
+        self.assertIn("MLAADHIGH", [item["key"] for item in product["matches"]])
+        self.assertTrue(next(item for item in product["matches"] if item["key"] == "MLAADHIGH")["ads_complete"])
+        self.assertFalse(product["matches"][0]["ads_complete"])
+
+    def test_detail_sales_below_top_ten_are_skipped(self) -> None:
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["matches"] = [
+            {
+                "url": f"https://articulo.mercadolibre.com.ar/MLA-{index}",
+                "key": f"MLA{index}",
+                "sales_text": "+100 vendidos",
+                "source": "search",
+                "candidate_id": f"old-{index}",
+                "ads_scraped": True,
+                "ads_complete": True,
+                "ad_candidates": [],
+            }
+            for index in range(10)
+        ]
+        product["listing"]["candidates"].append(
+            {
+                "candidate_id": "need-detail",
+                "url": "https://articulo.mercadolibre.com.ar/MLA-hidden",
+                "title": "Cubierta para estufa",
+                "sales_text": "",
+                "key": "MLAHIDDEN",
+                "similar": True,
+                "similarity": 0.9,
+            }
+        )
+        opened = self._stub_detail({"https://articulo.mercadolibre.com.ar/MLA-hidden": "+5 vendidos"})
+        try:
+            payload = self.service._open_judged_matches(
+                product,
+                [{"candidate_id": "need-detail", "similar": True, "confidence": 0.9, "reason": "同款"}],
+                "cursor-grok-4.5-low-fast",
+                "search",
+                None,
+            )
+        finally:
+            self._restore_sales_readers()
+        self.assertEqual(opened, ["https://articulo.mercadolibre.com.ar/MLA-hidden"])
+        self.assertIn("need-detail", payload.data["skipped"])
+        self.assertNotIn("MLAHIDDEN", [item["key"] for item in product["matches"]])
+
+    def test_detail_without_sales_is_not_recorded(self) -> None:
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["listing"]["candidates"].append(
+            {
+                "candidate_id": "no-sales",
+                "url": "https://articulo.mercadolibre.com.ar/MLA-empty",
+                "title": "Cubierta para estufa",
+                "key": "MLAEMPTY",
+                "similar": True,
+                "similarity": 0.9,
+            }
+        )
+        opened = self._stub_detail({"https://articulo.mercadolibre.com.ar/MLA-empty": ""})
+        try:
+            payload = self.service._open_judged_matches(
+                product,
+                [{"candidate_id": "no-sales", "similar": True, "confidence": 0.9, "reason": "同款"}],
+                "cursor-grok-4.5-low-fast",
+                "search",
+                None,
+            )
+        finally:
+            self._restore_sales_readers()
+        self.assertEqual(opened, ["https://articulo.mercadolibre.com.ar/MLA-empty"])
+        self.assertIn("no-sales", payload.data["skipped"])
+        self.assertNotIn("MLAEMPTY", [item["key"] for item in product["matches"]])
+
+    def test_listing_low_sales_still_queue_ads(self) -> None:
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["listing"]["page2_done"] = True
+        product["listing"]["next_index"] = 1
+        product["judged_ids"] = ["c1"]
+        product["matches"] = [
+            {
+                "source": "search",
+                "url": f"https://articulo.mercadolibre.com.ar/MLA-{index}",
+                "key": f"MLA{index}",
+                "sales_text": "+500 vendidos" if index < 10 else "+5 vendidos",
+                "ads_scraped": False,
+                "ads_complete": False,
+                "ad_candidates": [],
+                "ad_next_index": 0,
+                "image_path": "kept.jpg",
+                "candidate_id": f"m{index}",
+            }
+            for index in range(12)
+        ]
+        nxt = self.service._next_unscraped_ad_match(product)
+        self.assertEqual(nxt["key"], "MLA0")
+        product["matches"][0]["ads_scraped"] = True
+        product["matches"][0]["ads_complete"] = True
+        for index in range(1, 10):
+            product["matches"][index]["ads_scraped"] = True
+            product["matches"][index]["ads_complete"] = True
+        nxt = self.service._next_unscraped_ad_match(product)
+        self.assertEqual(nxt["key"], "MLA10")
+        self.assertEqual(nxt["sales_text"], "+5 vendidos")
 
     def test_clear_prefetch_flags(self) -> None:
         product = self.service.state["products"]["B07LCLQ47D"]

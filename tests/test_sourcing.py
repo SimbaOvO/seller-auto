@@ -26,6 +26,22 @@ def _chrome_for_testing() -> str:
     return str(matches[-1])
 
 
+def _image_list() -> str:
+    cards = []
+    for index, price in enumerate(("14.00", "16.50", "9.80"), start=1):
+        whole, fraction = price.split(".")
+        cards.append(
+            "<div class='productCell'><div class='card'>"
+            f"<img src='https://cbu01.alicdn.com/img/{index}.jpg'>"
+            "<div class='productPrice'>"
+            "<span class='priceSymbol'>￥</span>"
+            f"<span class='priceInteger'>{whole}</span>"
+            f"<span class='priceDecimal'>.{fraction}</span>"
+            "</div></div></div>"
+        )
+    return "<div id='list'>" + "".join(cards) + "</div>"
+
+
 def _offers(count: int) -> str:
     items = []
     for index in range(1, count + 1):
@@ -90,6 +106,8 @@ class SourcingTests(unittest.TestCase):
                 prices = page.evaluate(READ_PRICES_JS)
                 self.assertEqual(prices, [f"{index}.00" for index in range(1, 11)])
                 self.assertNotIn("99.00", prices)
+                page.set_content(_image_list())
+                self.assertEqual(page.evaluate(READ_PRICES_JS), ["14.00", "16.50", "9.80"])
             finally:
                 browser.close()
 

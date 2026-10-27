@@ -5,13 +5,16 @@ import unittest
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
 from PIL import Image as PILImage
 
 from seller_auto.workbook import (
     TEMPLATE_SHEET,
+    can_enter_top,
     dimension_cm,
     lowest_selling_price,
     ranked_matches,
+    sales_cutoff,
     template_path,
     weight_kg,
     write_product_workbook,
@@ -138,6 +141,25 @@ class WorkbookTests(unittest.TestCase):
         self.assertEqual([item["candidate_id"] for item in top], ["top-sales", "mid-sales", "low-sales"])
         self.assertEqual(lowest_selling_price(top), 12000)
 
+    def test_sales_cutoff_waits_until_ten_matches(self) -> None:
+        product = _product()
+        self.assertIsNone(sales_cutoff(product))
+        self.assertTrue(can_enter_top(product, "1 vendido"))
+        product["matches"] = [
+            {
+                "candidate_id": f"m{index}",
+                "url": f"https://www.mercadolibre.com.ar/p/MLA{index}",
+                "key": f"MLA{index}",
+                "sales_text": "+100 vendidos",
+                "source": "search",
+            }
+            for index in range(10)
+        ]
+        self.assertEqual(sales_cutoff(product), 100)
+        self.assertFalse(can_enter_top(product, "+50 vendidos"))
+        self.assertTrue(can_enter_top(product, "+100 vendidos"))
+        self.assertTrue(can_enter_top(product, "+500 vendidos"))
+
     def test_appends_a_row_with_price_links_and_listing_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.xlsx"
@@ -182,12 +204,38 @@ class WorkbookTests(unittest.TestCase):
             product["fba_fee"] = "2740.00"
             write_product_workbook(path, [product])
             sheet = load_workbook(path)[TEMPLATE_SHEET]
-            self.assertEqual(sheet.cell(3, _column(sheet, "名称")).value, "硅胶商品（50单）")
+            name = sheet.cell(3, _column(sheet, "名称"))
+            self.assertEqual(name.value, "硅胶商品\n（50单）")
+            self.assertTrue(name.alignment.wrap_text)
+            self.assertEqual(name.alignment.horizontal, "center")
+            self.assertEqual(name.alignment.vertical, "center")
+            self.assertEqual(sheet.cell(3, _column(sheet, "SKU")).alignment.horizontal, "center")
+            self.assertEqual(sheet.cell(3, _column(sheet, "采购成本")).alignment.vertical, "center")
             self.assertEqual(sheet.cell(3, _column(sheet, "预计数量")).value, 50)
             self.assertEqual(sheet.cell(3, _column(sheet, "预计方数")).value, "=AM3*H3")
             self.assertEqual(sheet.cell(3, _column(sheet, "预计货值")).value, "=AM3*M3")
             self.assertEqual(sheet.cell(3, _column(sheet, "FBA")).value, 2740)
             self.assertTrue(str(sheet.cell(3, _column(sheet, "尾程")).value).startswith("="))
+
+    def test_cost_and_fba_keep_the_previous_fill_and_roi_stays_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.xlsx"
+            _mini_workbook(path)
+            workbook = load_workbook(path)
+            sheet = workbook[TEMPLATE_SHEET]
+            yellow = PatternFill(fill_type="solid", fgColor="FFFF00")
+            sheet.cell(2, _column(sheet, "采购成本")).fill = yellow
+            sheet.cell(2, _column(sheet, "FBA")).fill = yellow
+            sheet.cell(2, _column(sheet, "投产比")).fill = PatternFill(fill_type="solid", fgColor="00B0F0")
+            workbook.save(path)
+            product = _product()
+            product["fba_fee"] = 2740
+            write_product_workbook(path, [product])
+            sheet = load_workbook(path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(3, _column(sheet, "采购成本")).fill.fgColor.rgb, "00FFFF00")
+            self.assertEqual(sheet.cell(3, _column(sheet, "FBA")).fill.fgColor.rgb, "00FFFF00")
+            self.assertIsNone(sheet.cell(3, _column(sheet, "投产比")).fill.patternType)
+            self.assertEqual(sheet.cell(3, _column(sheet, "投产比")).number_format, "0.00%")
 
     def test_formula_columns_copy_the_previous_row(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

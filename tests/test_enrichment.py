@@ -84,23 +84,40 @@ class EnrichmentTests(unittest.TestCase):
             service._schedule_enrichment("B07LCLQ47D", "https://example.com/img.jpg")
             self.assertTrue(started.wait(timeout=2))
 
-            finished: list = []
-
-            def do_export() -> None:
-                finished.append(service.export_results())
-
-            thread = threading.Thread(target=do_export)
-            thread.start()
-            time.sleep(0.15)
-            self.assertFalse(finished)
+            payload = service.export_results()
+            self.assertEqual(payload.data["status"], "exporting")
             release.set()
-            thread.join(timeout=5)
-            self.assertTrue(thread.is_alive() is False)
-            self.assertEqual(len(finished), 1)
-            payload = finished[0]
-            self.assertTrue(payload.data["ok"])
-            self.assertTrue(Path(payload.data["workbook"]).is_file())
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not (service.state.get("export_result") or {}).get("ok"):
+                time.sleep(0.05)
+            result = service.state.get("export_result") or {}
+            self.assertTrue(result.get("ok"))
+            self.assertTrue(Path(result["workbook"]).is_file())
             self.assertEqual(service.state["products"]["B07LCLQ47D"]["package_size"]["weight"], "454")
+
+    def test_source_price_comes_from_the_sellersprite_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            service.state = _product_state()
+
+            def fake_open(browser: object, asin: str) -> tuple[dict[str, str], str]:
+                self.assertEqual(asin, "B07LCLQ47D")
+                return {"weight": "260", "weight_unit": "g"}, "lookup-page"
+
+            def fake_source(browser: object, page: object, asin: str) -> dict[str, str]:
+                self.assertEqual(page, "lookup-page")
+                self.assertEqual(asin, "B07LCLQ47D")
+                return {"average": "8.00", "currency": "CNY", "count": "1"}
+
+            service._ensure_enrich_browser = lambda: object()
+            service._open_competitor = fake_open
+            service._read_1688_from_row = fake_source
+            event = threading.Event()
+            service._run_enrichment("B07LCLQ47D", "https://example.com/img.jpg", event)
+            self.assertTrue(event.is_set())
+            product = service.state["products"]["B07LCLQ47D"]
+            self.assertEqual(product["package_size"]["weight"], "260")
+            self.assertEqual(product["source_price"]["average"], "8.00")
 
 
 if __name__ == "__main__":

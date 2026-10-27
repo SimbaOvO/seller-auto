@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import threading
 import traceback
 
-from seller_auto.ipc import PID_PATH, SOCKET_PATH, encode_message, payload_to_message, read_message
+from seller_auto.ipc import CODE_REVISION, PID_PATH, SOCKET_PATH, encode_message, payload_to_message, read_message
 from seller_auto.pacing import DelaySettings
 from seller_auto.service import SellerAutoService
 from seller_auto.step_log import step
@@ -21,6 +22,11 @@ def main() -> None:
         SOCKET_PATH.unlink()
     settings = DelaySettings.from_argv()
     service = SellerAutoService(settings)
+
+    def _shutdown(signum: int, _frame: object) -> None:
+        raise SystemExit(signum)
+
+    signal.signal(signal.SIGTERM, _shutdown)
     step("后台", f"已启动，日志 {os.environ.get('SELLER_AUTO_LOG', 'logs/seller-auto.log')}")
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(SOCKET_PATH))
@@ -50,6 +56,15 @@ def _handle_connection(connection: socket.socket, service: SellerAutoService, wo
                 connection.sendall(encode_message({"ok": True}))
             except OSError:
                 return
+            return
+        if method == "revision":
+            try:
+                connection.sendall(encode_message({"ok": True, "revision": CODE_REVISION}))
+            except OSError:
+                return
+            return
+        if method == "session_status":
+            _run_tool(connection, service, method, request.get("params") or {})
             return
         with work:
             _run_tool(connection, service, method, request.get("params") or {})

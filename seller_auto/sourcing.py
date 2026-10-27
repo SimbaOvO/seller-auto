@@ -24,6 +24,22 @@ _LOGIN_HOSTS = (
 
 READ_PRICES_JS = r"""
 () => {
+  const listed = [];
+  const seenPrices = new Set();
+  for (const block of document.querySelectorAll('[class*="productCell"] [class*="productPrice"]')) {
+    if (seenPrices.has(block)) continue;
+    seenPrices.add(block);
+    const integer = block.querySelector('[class*="priceInteger"]');
+    if (!integer) continue;
+    const whole = (integer.textContent || "").replace(/\s+/g, "");
+    if (!/^\d+$/.test(whole)) continue;
+    const decimalNode = block.querySelector('[class*="priceDecimal"]');
+    const decimal = decimalNode ? (decimalNode.textContent || "").replace(/\s+/g, "") : "";
+    const fraction = decimal.startsWith(".") ? decimal.slice(1) : decimal;
+    listed.push(fraction && /^\d+$/.test(fraction) ? whole + "." + fraction : whole);
+    if (listed.length >= 10) return listed;
+  }
+  if (listed.length) return listed;
   const skipClass = /del|through|old|origin|line-through/i;
   const priceText = /^[¥￥]?(\d+(?:\.\d+)?)(?:[-~～]\d+(?:\.\d+)?)?(?:起)?$/;
   const offerSelector = 'a[href*="detail.1688.com/offer/"], a[href*="detail.m.1688.com/offer/"]';
@@ -133,6 +149,184 @@ def average_price(prices: list[str]) -> str | None:
     return str(mean.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+_SORT_BY_SALES_JS = r"""
+() => {
+  const exact = (el) => (el.innerText || "").replace(/\s+/g, "") === "销量" && el.children.length === 0;
+  const nodes = [...document.querySelectorAll("a, span, div, li, button")].filter(exact);
+  const sort = nodes.find((el) => {
+    const parent = el.parentElement;
+    return !!parent && (parent.innerText || "").includes("综合");
+  });
+  if (!sort) return false;
+  sort.click();
+  return true;
+}
+"""
+
+
+def source_from_prices(prices: list[str], url: str) -> dict[str, Any] | None:
+    average = average_price(prices)
+    if average is None:
+        return None
+    kept = [str(item) for item in prices[:_SOURCE_LIMIT] if str(item)]
+    return {
+        "average": average,
+        "currency": "CNY",
+        "count": len(kept),
+        "prices": kept,
+        "url": url,
+    }
+
+
+_LIST_READY_JS = r"""
+() => {
+  const prices = [...document.querySelectorAll('[class*="productCell"] [class*="productPrice"]')];
+  let ready = 0;
+  for (const price of prices) {
+    let node = price;
+    for (let depth = 0; depth < 8 && node; depth += 1, node = node.parentElement) {
+      const image = [...node.querySelectorAll("img")].find((img) => {
+        const src = img.currentSrc || img.src || "";
+        return src.startsWith("http") && img.getClientRects().length > 0;
+      });
+      if (!image) continue;
+      ready += 1;
+      break;
+    }
+  }
+  return ready;
+}
+"""
+
+
+_FIRST_PRICE_JS = r"""
+() => {
+  const block = document.querySelector('[class*="productCell"] [class*="productPrice"]');
+  if (!block) return "";
+  return (block.innerText || "").replace(/\s+/g, "");
+}
+"""
+
+
+def collect_visible_prices(page: Any) -> list[str]:
+    """等图搜主图商品列表替换掉页面先闪出的推荐，再按销量读取前 10 个价格。"""
+
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    started = _monotonic()
+    deadline = started + 30
+    placeholder = None
+    replaced = False
+    stable = ""
+    stable_rounds = 0
+    sorted_once = False
+    announced = False
+    latest: list[str] = []
+    while _monotonic() < deadline:
+        try:
+            page.evaluate(_DISMISS_JS)
+        except Exception:
+            pass
+        try:
+            ready = int(page.evaluate(_LIST_READY_JS) or 0)
+            first = str(page.evaluate(_FIRST_PRICE_JS) or "")
+        except Exception:
+            ready = 0
+            first = ""
+        if ready <= 0 or not first:
+            try:
+                page.wait_for_timeout(_POLL_MS)
+            except PlaywrightTimeout:
+                break
+            continue
+        if placeholder is None:
+            placeholder = first
+            try:
+                page.wait_for_timeout(_POLL_MS)
+            except PlaywrightTimeout:
+                break
+            continue
+        if first != placeholder:
+            replaced = True
+        if not replaced and _monotonic() - started < 8:
+            try:
+                page.wait_for_timeout(_POLL_MS)
+            except PlaywrightTimeout:
+                break
+            continue
+        if first != stable:
+            stable = first
+            stable_rounds = 0
+            try:
+                page.wait_for_timeout(_POLL_MS)
+            except PlaywrightTimeout:
+                break
+            continue
+        stable_rounds += 1
+        if stable_rounds < 2:
+            try:
+                page.wait_for_timeout(_POLL_MS)
+            except PlaywrightTimeout:
+                break
+            continue
+        if not announced:
+            step("1688", f"主图商品列表已加载 {ready} 条")
+            announced = True
+        if not sorted_once:
+            try:
+                sorted_once = bool(page.evaluate(_SORT_BY_SALES_JS))
+            except Exception:
+                sorted_once = False
+            if sorted_once:
+                try:
+                    page.wait_for_timeout(1500)
+                except PlaywrightTimeout:
+                    return latest
+                continue
+        try:
+            raw = page.evaluate(READ_PRICES_JS)
+        except Exception:
+            raw = []
+        latest = [str(item) for item in raw or [] if str(item)][:_SOURCE_LIMIT]
+        if latest:
+            return latest
+        try:
+            page.wait_for_timeout(_POLL_MS)
+        except PlaywrightTimeout:
+            break
+    return latest
+
+
+def read_page_source(browser: Any, page: Any) -> dict[str, Any] | None:
+    """1688 结果页等到价格出现。需要登录时把窗口调到前台。"""
+
+    import time
+
+    current = page
+    if is_login_url(getattr(current, "url", "") or ""):
+        current = browser.reveal(current, "1688 需要登录，请在前台窗口完成")
+        deadline = _monotonic() + 90
+        while _monotonic() < deadline:
+            current = browser.live_page(current)
+            if not is_login_url(getattr(current, "url", "") or ""):
+                current = browser.restore_background(current)
+                break
+            time.sleep(2)
+        else:
+            step("1688", "登录没有完成")
+            return None
+        if is_login_url(getattr(current, "url", "") or ""):
+            step("1688", "登录没有完成")
+            return None
+    prices = collect_visible_prices(current)
+    record = source_from_prices(prices, getattr(current, "url", "") or "")
+    if record is None:
+        step("1688", "没有读到货源价格")
+        return None
+    step("1688", f"已记录货源均价 {record['average']}（{record['count']}个）")
+    return record
+
+
 def read_source_average(browser: Any, image_url: str) -> dict[str, Any] | None:
     image = amazon_search_image(image_url)
     if not image.startswith("http"):
@@ -150,14 +344,10 @@ def read_source_average(browser: Any, image_url: str) -> dict[str, Any] | None:
         if average is None:
             step("1688", "没有读到货源价格")
             return None
-        step("1688", f"已记录货源均价 {average}（{len(prices)}个）")
-        return {
-            "average": average,
-            "currency": "CNY",
-            "count": len(prices),
-            "prices": prices,
-            "url": url,
-        }
+        record = source_from_prices(prices, url)
+        if record is not None:
+            step("1688", f"已记录货源均价 {record['average']}（{record['count']}个）")
+        return record
     finally:
         browser.close_detail()
 

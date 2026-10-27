@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import queue
 import threading
 import traceback
@@ -22,7 +23,7 @@ from seller_auto.amazon import (
 from seller_auto.browser import NEEDS_HUMAN, ArgentinaBrowser, log
 from seller_auto.categories import category_reason, classify_breadcrumb
 from seller_auto.images import save_original, to_client_jpeg
-from seller_auto.lingdong import collect_market_quotes, quote_links
+from seller_auto.lingdong import apply_last_mile, collect_market_quotes, quote_links
 from seller_auto.matches import (
     TITLE_FILTER_MODEL,
     TITLE_MISMATCH_REASON,
@@ -40,16 +41,17 @@ from seller_auto.mercadolibre import (
     read_sales_text,
     sales_from_text,
 )
-from seller_auto.workbook import template_path, write_product_workbook
+from seller_auto.sales import has_sales
+from seller_auto.workbook import can_enter_top, template_path, write_product_workbook
 from seller_auto.pacing import DelaySettings
-from seller_auto.sales import sales_action
-from seller_auto.sellersprite import read_package_size
-from seller_auto.sourcing import read_source_average
-from seller_auto.progress import next_required_step
+from seller_auto.sellersprite import open_1688_from_row, open_competitor, read_package_size
+from seller_auto.sourcing import read_page_source
+from seller_auto.progress import next_required_step, products_ready_to_export
 from seller_auto.storage import (
     atomic_write_json,
     build_export,
     discard_finished_images,
+    discard_product_images,
     export_filename,
     find_state_by_session,
     load_json,
@@ -163,6 +165,7 @@ class SellerAutoService:
         self._enrich_worker = _Worker(name="seller-auto-enrich")
         self._enrich_events: dict[str, threading.Event] = {}
         self._state_lock = threading.Lock()
+        self._published: dict[str, Any] | None = None
 
     def open_store(self, seller_id: str, product: str = "") -> ToolPayload:
         return self._guard(self._open_store, seller_id, product)
@@ -177,22 +180,25 @@ class SellerAutoService:
         return self._guard(self._next_listing_batch)
 
     def submit_listing_matches(self, matches: list[Any], model_name: str = "") -> ToolPayload:
-        return self._guard(self._submit_listing_matches, matches, model_name)
+        return self._guard(self._accept_matches, matches, model_name, "search")
 
     def next_ad_batch(self, product_id: str) -> ToolPayload:
         return self._guard(self._next_ad_batch, product_id)
 
     def submit_ad_matches(self, matches: list[Any], model_name: str = "") -> ToolPayload:
-        return self._guard(self._submit_ad_matches, matches, model_name)
+        return self._guard(self._accept_matches, matches, model_name, "recommendation")
 
     def session_status(self) -> ToolPayload:
-        return self._guard(self._session_status)
+        return self._read_status()
 
     def resume_session(self, session_id: str) -> ToolPayload:
         return self._guard(self._resume_session, session_id)
 
     def export_results(self) -> ToolPayload:
-        return self._guard(self._export_results)
+        try:
+            return self._start_export()
+        except UrlError as exc:
+            return ToolPayload({"ok": False, "status": "error", "message": str(exc)})
 
     def _guard(self, function: Callable[..., ToolPayload], *args: Any) -> ToolPayload:
         try:
@@ -227,14 +233,19 @@ class SellerAutoService:
 
     def _save(self) -> None:
         with self._state_lock:
-            self._write_state()
+            self._commit_locked()
 
-    def _write_state(self) -> None:
+    def _commit_locked(self) -> None:
         state = self._require_state()
         if self.browser is not None:
             state["challenge_pending"] = self.browser.challenge_pending
             state["challenge_site"] = self.browser.challenge_site
         state["updated_at"] = _now()
+        self._published = copy.deepcopy(state)
+        self._write_state()
+
+    def _write_state(self) -> None:
+        state = self._require_state()
         atomic_write_json(state_path(self.output_dir, _storage_id(state)), state)
 
     def close(self) -> None:
@@ -260,7 +271,9 @@ class SellerAutoService:
         browser.challenge_site = state.get("challenge_site") or ""
 
     def _status(self) -> dict[str, Any]:
-        state = self._require_state()
+        return self._status_from(self._require_state())
+
+    def _status_from(self, state: dict[str, Any]) -> dict[str, Any]:
         current = state.get("current_product_id")
         remaining = 0
         if current and current in state["products"]:
@@ -280,9 +293,15 @@ class SellerAutoService:
             "next_step": next_required_step(state),
         }
 
-    def _payload(self, data: dict[str, Any], images: list[tuple[str, str]] | None = None) -> ToolPayload:
-        if self.state is not None:
-            data = {**self._status(), **data}
+    def _payload(
+        self,
+        data: dict[str, Any],
+        images: list[tuple[str, str]] | None = None,
+        state: dict[str, Any] | None = None,
+    ) -> ToolPayload:
+        current = self.state if state is None else state
+        if current is not None:
+            data = {**self._status_from(current), **data}
         encoded: list[tuple[str, bytes]] = []
         for caption, path in images or []:
             jpeg = _jpeg_file(path)
@@ -353,42 +372,270 @@ class SellerAutoService:
             }
         )
 
-    def _session_status(self) -> ToolPayload:
-        self._require_state()
-        return self._payload({"ok": True, "status": "status"})
+    def _read_status(self) -> ToolPayload:
+        try:
+            self._kick_sales_if_idle()
+            self._kick_export_if_idle()
+            with self._state_lock:
+                if self.state is None and self._published is None:
+                    raise UrlError("还没有会话。请先调用 open_store 或 resume_session")
+                snapshot = copy.deepcopy(self._published if self._published is not None else self.state)
+            if snapshot is None:
+                raise UrlError("还没有会话。请先调用 open_store 或 resume_session")
+            return self._payload(
+                {"ok": True, "status": "status", "message": self._status_message(snapshot)},
+                state=snapshot,
+            )
+        except UrlError as exc:
+            return ToolPayload({"ok": False, "status": "error", "message": str(exc)})
 
-    def _export_results(self) -> ToolPayload:
-        self._wait_enrichment()
-        market_note = self._collect_market_quotes()
+    def _status_message(self, state: dict[str, Any]) -> str:
+        if state.get("export_pending"):
+            return "正在查询蓝鲸并写入表格。请继续 session_status，不要重复 export_results。"
+        products = state.get("products") or {}
+        product = products.get(state.get("current_product_id") or "") or {}
+        if product.get("sales_pending"):
+            if state.get("challenge_pending"):
+                return "需要手动验证。在前台完成后再次调用 session_status，不要重复提交。"
+            detail = str(product.get("sales_error") or "")
+            if detail:
+                return f"打开详情没有完成：{detail}。请再次 session_status，不要重复提交。"
+            return "同款详情还在打开。请继续 session_status，不要重复提交，也不要取下一批。"
+        step_name = next_required_step(state)
+        exported_message = self._visible_export_message(state, step_name)
+        if exported_message:
+            return exported_message
+        if step_name == "submit_listing_matches":
+            return "这批列表图还没有提交判断。图还在就直接提交；如果上次返回丢了，再调用 next_listing_batch，会把同一批发回来。"
+        if step_name == "submit_ad_matches":
+            return "这批广告图还没有提交判断。图还在就直接提交；如果上次返回丢了，再调用 next_ad_batch，会把同一批发回来。"
+        return self._step_message("进度已更新。", step_name)
+
+    def _visible_export_message(self, state: dict[str, Any], step_name: str) -> str:
+        exported = state.get("export_result") or {}
+        message = str(exported.get("message") or "")
+        if not message:
+            return ""
+        if state.get("amazon_done") and not products_ready_to_export(state):
+            if "遍历完" in message:
+                return message
+            return "店铺列表已遍历完。不要再调用 next_amazon_product。"
+        if step_name == "export_results":
+            return message
+        if step_name == "next_amazon_product" and exported.get("product_id") == state.get("current_product_id"):
+            return message
+        return ""
+
+    def _start_export(self) -> ToolPayload:
+        with self._state_lock:
+            state = self._require_state()
+            product = (state.get("products") or {}).get(state.get("current_product_id") or "")
+            if product and product.get("sales_pending"):
+                snapshot = copy.deepcopy(state)
+                waiting = True
+            else:
+                waiting = False
+                if state.get("export_pending"):
+                    snapshot = copy.deepcopy(self._published or state)
+                    return self._payload(
+                        {
+                            "ok": True,
+                            "status": "exporting",
+                            "message": "正在查询蓝鲸并写入表格。请继续 session_status，不要重复 export_results。",
+                        },
+                        state=snapshot,
+                    )
+                ready = products_ready_to_export(state)
+                if not ready:
+                    return self._idle_export_payload(state)
+                state["export_ids"] = ready
+                state["export_pending"] = True
+                state["export_running"] = True
+                state["export_result"] = {}
+                self._commit_locked()
+                snapshot = copy.deepcopy(self._published or state)
+        if waiting:
+            return self._payload(
+                {
+                    "ok": True,
+                    "status": "status",
+                    "message": "同款详情还在打开。请先 session_status，完成后再 export_results。",
+                },
+                state=snapshot,
+            )
+        self._enrich_worker.submit(self._finish_export)
+        return self._payload(
+            {
+                "ok": True,
+                "status": "exporting",
+                "message": "这一条 ASIN 已经走完。正在查询蓝鲸并写入表格。请继续 session_status，不要重复 export_results。",
+            },
+            state=snapshot,
+        )
+
+    def _idle_export_payload(self, state: dict[str, Any]) -> ToolPayload:
+        saved = state.get("export_result") or {}
+        if state.get("amazon_done"):
+            message = "店铺列表已遍历完。不要再调用 next_amazon_product。"
+            if saved.get("message") and "遍历完" in str(saved.get("message")):
+                message = str(saved["message"])
+        elif saved.get("message") and saved.get("product_id") == state.get("current_product_id"):
+            message = str(saved["message"])
+        elif state.get("single_product"):
+            message = "这一条商品已经处理完。不要再调用 next_amazon_product。"
+        else:
+            message = "这一条商品已经写入表格。请继续 next_amazon_product，直到返回 end_of_store。"
+        return self._payload(
+            {
+                "ok": True,
+                "status": "exported",
+                "path": saved.get("path") or "",
+                "workbook": saved.get("workbook") or "",
+                "message": message,
+            },
+            state=copy.deepcopy(state),
+        )
+
+    def _kick_export_if_idle(self) -> None:
+        with self._state_lock:
+            state = self.state
+            if not state or not state.get("export_pending") or state.get("export_running"):
+                return
+            state["export_running"] = True
+            self._commit_locked()
+        self._enrich_worker.submit(self._finish_export)
+
+    def _finish_export(self) -> None:
+        try:
+            self._wait_enrichment()
+            with self._state_lock:
+                state = self._require_state()
+                export_ids = list(state.get("export_ids") or products_ready_to_export(state))
+            market_note = self._market_quotes_inline(export_ids)
+            message, path, workbook = self._write_export_files(market_note, export_ids)
+            with self._state_lock:
+                if self.state is None:
+                    return
+                current = self.state.get("current_product_id")
+                product_id = current if current in export_ids else (export_ids[-1] if export_ids else current)
+                self.state["export_pending"] = False
+                self.state["export_running"] = False
+                self.state["export_ids"] = []
+                self.state["export_result"] = {
+                    "ok": True,
+                    "status": "exported",
+                    "path": path,
+                    "workbook": workbook,
+                    "product_id": product_id or "",
+                    "message": message,
+                }
+                self._commit_locked()
+            self._discard_finished_images()
+        except Exception as exc:
+            log(traceback.format_exc())
+            with self._state_lock:
+                if self.state is not None:
+                    self.state["export_pending"] = False
+                    self.state["export_running"] = False
+                    self.state["export_ids"] = []
+                    self.state["export_result"] = {"ok": False, "status": "error", "message": str(exc)}
+                    self._commit_locked()
+            step("导出", f"没有写完：{exc}")
+
+    def _market_quotes_inline(self, export_ids: list[str]) -> str:
+        state = self._require_state()
+        jobs = []
+        for product_id in export_ids:
+            product = state["products"].get(product_id) or {}
+            links = quote_links(product)
+            if not links:
+                continue
+            jobs.append({"product_id": product_id, "links": links, "package": product.get("package_size")})
+        if not jobs:
+            return ""
+        try:
+            return self._run_market_quotes(jobs)
+        except Exception as exc:
+            step("蓝鲸", f"查询失败：{exc}")
+            log(traceback.format_exc())
+            return "蓝鲸选品没有查成，单量这次没写。"
+
+    def _write_export_files(self, market_note: str, export_ids: list[str]) -> tuple[str, str, str]:
+        freight_note = self._record_last_mile(export_ids)
         state = self._require_state()
         payload = build_export(state)
         directory = seller_dir(self.output_dir, _storage_id(state))
         path = directory / export_filename()
         atomic_write_json(path, payload)
         workbook_path = self.workbook_path
-        products = [state["products"][product_id] for product_id in state.get("product_order", [])]
+        products = [state["products"][product_id] for product_id in export_ids if product_id in state["products"]]
         written = write_product_workbook(workbook_path, products)
-        removed = self._discard_finished_images()
+        self._mark_workbook_written(export_ids)
+        removed = self._discard_exported_images(export_ids)
         if written:
             if state.get("single_product"):
                 message = f"这一条商品的结果已追加到 {workbook_path}。不要再调用 next_amazon_product。"
             elif state.get("amazon_done"):
-                message = f"店铺列表已遍历完，结果已追加到 {workbook_path}。"
+                message = f"这一条商品的结果已追加到 {workbook_path}。店铺列表已遍历完。"
             else:
-                message = f"这是部分结果，已追加到 {workbook_path}。店铺还有未查看的商品，请继续 next_amazon_product，直到返回 end_of_store。"
+                message = f"这一条商品的结果已追加到 {workbook_path}。请继续 next_amazon_product，直到返回 end_of_store。"
         elif state.get("single_product"):
             message = "这一条没有同款，没有写入表格。不要再调用 next_amazon_product。"
         elif state.get("amazon_done"):
             message = "店铺列表已遍历完，没有同款，没有写入表格。"
         else:
-            message = "当前没有同款，没有写入表格。店铺还有未查看的商品，请继续 next_amazon_product，直到返回 end_of_store。"
+            message = "这一条没有同款，没有写入表格。请继续 next_amazon_product，直到返回 end_of_store。"
         if removed:
             message = f"{message} 已删除过程图片 {removed} 个。"
         if market_note:
             message = f"{message} {market_note}"
-        return self._payload(
-            {"ok": True, "status": "exported", "path": str(path), "workbook": str(workbook_path), "message": message}
-        )
+        if freight_note:
+            message = f"{message} {freight_note}"
+        return message, str(path), str(workbook_path)
+
+    def _mark_workbook_written(self, export_ids: list[str]) -> None:
+        with self._state_lock:
+            state = self.state
+            if state is None:
+                return
+            for product_id in export_ids:
+                product = state["products"].get(product_id)
+                if product is not None:
+                    product["workbook_written"] = True
+            self._commit_locked()
+
+    def _record_last_mile(self, export_ids: list[str]) -> str:
+        recorded = False
+        with self._state_lock:
+            state = self.state
+            if state is None:
+                return ""
+            for product_id in export_ids:
+                product = state["products"].get(product_id)
+                if product and apply_last_mile(product) is not None:
+                    recorded = True
+            if recorded:
+                self._commit_locked()
+        if recorded:
+            return "尾程运费已按包装和最低售价写入 FBA 运费。"
+        return ""
+
+    def _discard_exported_images(self, export_ids: list[str]) -> int:
+        state = self.state
+        if state is None:
+            return 0
+        removed = 0
+        for product_id in export_ids:
+            product = (state.get("products") or {}).get(product_id)
+            if not product:
+                continue
+            try:
+                removed += discard_product_images(product)
+            except Exception as exc:
+                log(f"清理过程图片失败：{exc}")
+        if removed:
+            step("清理", f"已删除过程图片 {removed} 个")
+        return removed
 
     def _discard_finished_images(self) -> int:
         try:
@@ -517,7 +764,7 @@ class SellerAutoService:
             self._leave_amazon_detail(browser, opened_new_tab, state)
             if state.get("single_product"):
                 state["amazon_done"] = True
-                message = f"已跳过{reason}类商品。这一条已结束，请 export_results，不要再翻店铺。"
+                message = f"已跳过{reason}类商品。这一条已结束，不要再翻店铺。"
             else:
                 message = f"已跳过{reason}类商品。请继续调用 next_amazon_product。"
             self._save()
@@ -569,7 +816,7 @@ class SellerAutoService:
             message = (
                 "请根据主图给出西班牙语搜索关键词，然后调用 set_keywords。"
                 "卖家精灵和货源查询已在后台并行开始，不要等它们。"
-                "美客多流程结束后再调用 next_amazon_product。"
+                "这一条筛完后服务会自己写表并打开下一条，不要调用 export_results。"
             )
         return self._payload(
             {
@@ -616,7 +863,7 @@ class SellerAutoService:
         except Exception as exc:
             step("蓝鲸", f"查询失败：{exc}")
             log(traceback.format_exc())
-            return "蓝鲸选品没有查成，名称和 FBA 运费这次没写。"
+            return "蓝鲸选品没有查成，单量这次没写。"
 
     def _run_market_quotes(self, jobs: list[dict[str, Any]]) -> str:
         browser = self._ensure_enrich_browser()
@@ -633,38 +880,79 @@ class SellerAutoService:
             if quote.get("orders") is not None:
                 product["market_orders"] = quote["orders"]
                 wrote = True
-            if quote.get("fba_fee") is not None:
-                product["fba_fee"] = quote["fba_fee"]
-                wrote = True
         self._save()
         if wrote:
-            return "蓝鲸选品已把 30 天销量写入名称，并把尾程运费写入 FBA 运费。"
-        return "蓝鲸选品没有查到这些链接，名称和 FBA 运费保持原样。"
+            return "蓝鲸选品已把 30 天销量写入名称。"
+        return "蓝鲸选品没有查到这些链接，单量保持原样。"
 
     def _ensure_enrich_browser(self) -> ArgentinaBrowser:
         if self.enrich_browser is None:
             enrich_dir = Path(str(self.profile_dir) + "-enrich")
-            self.enrich_browser = ArgentinaBrowser(self.settings, enrich_dir, headless=self.headless)
+            self.enrich_browser = ArgentinaBrowser(
+                self.settings,
+                enrich_dir,
+                headless=self.headless,
+                locale="zh-CN",
+                accept_language="zh-CN,zh;q=0.9",
+                timezone_id="Asia/Shanghai",
+                geolocation={"latitude": 31.2304, "longitude": 121.4737},
+            )
         self.enrich_browser.start()
         assert self.enrich_browser is not None
         return self.enrich_browser
 
     def _run_enrichment(self, product_id: str, image_url: str, event: threading.Event) -> None:
+        _ = image_url
+        package = None
+        source = None
         try:
             browser = self._ensure_enrich_browser()
-            package = self._read_package_size(browser, product_id)
-            source = self._read_source_price(browser, image_url)
+            package, page = self._open_competitor(browser, product_id)
+            if page is not None:
+                source = self._read_1688_from_row(browser, page, product_id)
             with self._state_lock:
                 if self.state and product_id in self.state.get("products", {}):
                     self.state["products"][product_id]["package_size"] = package
                     self.state["products"][product_id]["source_price"] = source
-                    self._write_state()
-            step("资料", f"{product_id} 包装和货源已写回")
+                    apply_last_mile(self.state["products"][product_id])
+                    self._commit_locked()
+            if package and source:
+                step("资料", f"{product_id} 包装和货源已写回")
+            elif package:
+                step("资料", f"{product_id} 包装已写回，没有读到货源均价")
+            elif source:
+                step("资料", f"{product_id} 货源已写回，没有读到包装")
+            else:
+                step("资料", f"{product_id} 没有读到包装和货源")
         except Exception as exc:
             step("资料", f"{product_id} 后台查询失败：{exc}")
             log(traceback.format_exc())
         finally:
+            try:
+                if self.enrich_browser is not None:
+                    self.enrich_browser.close_detail()
+            except Exception:
+                log("关闭资料页失败")
             event.set()
+
+    def _open_competitor(self, browser: ArgentinaBrowser, asin: str) -> tuple[dict[str, str] | None, Any]:
+        try:
+            return open_competitor(browser, asin)
+        except Exception as exc:
+            step("卖家精灵", f"没有读到包装尺寸：{exc}")
+            log(traceback.format_exc())
+            return None, None
+
+    def _read_1688_from_row(self, browser: ArgentinaBrowser, page: Any, asin: str) -> dict[str, Any] | None:
+        try:
+            opened = open_1688_from_row(browser, page, asin)
+            if opened is None:
+                return None
+            return read_page_source(browser, opened)
+        except Exception as exc:
+            step("1688", f"没有读到货源均价：{exc}")
+            log(traceback.format_exc())
+            return None
 
     def _read_package_size(self, browser: ArgentinaBrowser, asin: str) -> dict[str, str] | None:
         try:
@@ -676,18 +964,6 @@ class SellerAutoService:
                 browser.close_detail()
             except Exception:
                 log("关闭卖家精灵标签失败")
-            return None
-
-    def _read_source_price(self, browser: ArgentinaBrowser, image_url: str) -> dict[str, Any] | None:
-        try:
-            return read_source_average(browser, image_url)
-        except Exception as exc:
-            step("1688", f"没有读到货源均价：{exc}")
-            log(traceback.format_exc())
-            try:
-                browser.close_detail()
-            except Exception:
-                log("关闭1688标签失败")
             return None
 
     def _leave_amazon_detail(self, browser: ArgentinaBrowser, opened_new_tab: bool, state: dict[str, Any]) -> None:
@@ -734,6 +1010,18 @@ class SellerAutoService:
         product = self._current_product()
         if not product.get("ml_search_url"):
             return self._payload({"ok": False, "status": "need_keywords", "message": "请先调用 set_keywords"})
+        with self._state_lock:
+            pending = list(
+                _unjudged_delivered(
+                    product["listing"]["candidates"],
+                    product["listing"].get("next_index"),
+                    product.get("judged_ids"),
+                )
+            )
+        if pending:
+            self._ensure_candidate_files(pending, page_url=product["ml_search_url"])
+            self._save()
+            return self._candidate_payload(product, pending, "listing_batch")
         listing = product["listing"]
         browser = self._ensure_browser()
         if not listing["page1_done"]:
@@ -810,9 +1098,10 @@ class SellerAutoService:
             log(traceback.format_exc())
         finally:
             if listing is not None:
-                listing["page2_prefetching"] = False
                 try:
-                    self._save()
+                    with self._state_lock:
+                        listing["page2_prefetching"] = False
+                        self._commit_locked()
                 except Exception:
                     log("保存列表预取状态失败")
 
@@ -826,10 +1115,262 @@ class SellerAutoService:
                 listing.pop("page2_prefetching", None)
             product.pop("ad_prefetching", None)
 
-    def _submit_listing_matches(self, matches: list[Any], model_name: str) -> ToolPayload:
+    def _accept_matches(self, matches: list[Any], model_name: str, source: str) -> ToolPayload:
+        try:
+            with self._state_lock:
+                product = self._current_product()
+                if self._matches_already_judged(product, matches):
+                    snapshot = copy.deepcopy(self._published or self.state)
+                    return self._payload(
+                        {
+                            "ok": True,
+                            "status": "already_submitted",
+                            "product_id": product.get("product_id"),
+                            "source": source,
+                            "message": "这一批已经提交过。不要重复提交。手上的下一批图还在就直接判断。",
+                        },
+                        state=snapshot,
+                    )
+                self._apply_match_decisions(product, matches, model_name)
+                needs_open = self._has_pending_sales(product)
+                product_id = str(product.get("product_id") or "")
+                self._commit_locked()
+            note = (
+                "判断已记录，同款详情在后台打开。下面是下一批列表图。"
+                if needs_open
+                else "判断已记录。下面是下一批列表图。"
+            )
+            ready = self._ready_listing_batch(note)
+            if ready is not None:
+                if needs_open:
+                    self._queue_sales(prefetch_listing=not self._current_product()["listing"].get("page2_done"))
+                return ready
+            if needs_open:
+                self._mark_sales_started()
+                self._drain_sales()
+                waiting = self._sales_wait_payload(product_id, source)
+                if waiting is not None:
+                    return waiting
+            recorded = self._payload(
+                {
+                    "ok": True,
+                    "status": "matches_recorded",
+                    "product_id": product_id,
+                    "source": source,
+                    "message": "判断已记录。",
+                }
+            )
+            return self._attach_followup(recorded)
+        except (UrlError, MatchInputError) as exc:
+            return ToolPayload({"ok": False, "status": "error", "message": str(exc)})
+
+    def _matches_already_judged(self, product: dict[str, Any], matches: list[Any]) -> bool:
+        judged = set(product.get("judged_ids") or [])
+        ids = []
+        for raw in matches:
+            if hasattr(raw, "model_dump"):
+                data = raw.model_dump()
+            elif isinstance(raw, dict):
+                data = raw
+            else:
+                return False
+            candidate_id = str(data.get("candidate_id") or "").strip()
+            if not candidate_id:
+                return False
+            ids.append(candidate_id)
+        return bool(ids) and all(candidate_id in judged for candidate_id in ids)
+
+    def _mark_sales_started(self) -> None:
+        with self._state_lock:
+            product = self._current_product()
+            product["sales_pending"] = True
+            product["sales_error"] = ""
+            product["sales_running"] = True
+            self._commit_locked()
+
+    def _queue_sales(self, prefetch_listing: bool) -> None:
+        self._mark_sales_started()
+
+        def run() -> None:
+            self._drain_sales()
+            if not prefetch_listing:
+                return
+            product = (self.state or {}).get("products", {}).get((self.state or {}).get("current_product_id") or "")
+            listing = (product or {}).get("listing") or {}
+            if product and not listing.get("page2_done") and product.get("ml_search_url"):
+                self._schedule_listing_prefetch(product)
+
+        self._worker.submit(run)
+
+    def _sales_wait_payload(self, product_id: str, source: str) -> ToolPayload | None:
+        state = self._require_state()
+        product = state["products"].get(product_id) or {}
+        if state.get("challenge_pending"):
+            return self._payload(
+                {
+                    "ok": False,
+                    "status": "needs_human_verification",
+                    "product_id": product_id,
+                    "source": source,
+                    "message": "需要手动验证。在前台完成后再次调用 session_status，不要重复提交。",
+                }
+            )
+        if product.get("sales_pending"):
+            detail = str(product.get("sales_error") or "")
+            message = f"打开详情没有完成：{detail}。请再次 session_status，不要重复提交。" if detail else (
+                "同款详情还在打开。请再次 session_status，不要重复提交。"
+            )
+            return self._payload(
+                {
+                    "ok": True,
+                    "status": "sales_started",
+                    "product_id": product_id,
+                    "source": source,
+                    "message": message,
+                }
+            )
+        return None
+
+    def _ready_listing_batch(self, lead: str) -> ToolPayload | None:
+        """内存里已经有的下一批列表图。不翻页，方便和详情打开并行。"""
+
         product = self._current_product()
-        payload = self._open_judged_matches(product, matches, model_name, source="search", parent_url=None)
-        return self._attach_followup(payload)
+        if not product.get("ml_search_url"):
+            return None
+        listing = product["listing"]
+        with self._state_lock:
+            pending = list(
+                _unjudged_delivered(
+                    listing["candidates"],
+                    listing.get("next_index"),
+                    product.get("judged_ids"),
+                )
+            )
+        if pending:
+            self._ensure_candidate_files(pending, page_url=product["ml_search_url"])
+            self._save()
+            return self._candidate_payload(product, pending, "listing_batch", lead)
+        if int(listing.get("next_index") or 0) >= len(listing.get("candidates") or []):
+            return None
+        batch = self._take_candidates(product)
+        if not batch:
+            return None
+        return self._candidate_payload(product, batch, "listing_batch", lead)
+
+    def _apply_match_decisions(self, product: dict[str, Any], matches: list[Any], model_name: str) -> None:
+        kept, dropped = filter_matches(matches, self.settings.similarity_threshold)
+        known = self._candidate_index(product)
+        for item in kept + dropped:
+            candidate = known.get(item["candidate_id"])
+            if candidate is None:
+                continue
+            candidate["similarity"] = item["confidence"]
+            candidate["similar"] = item["similar"]
+            candidate["reason"] = item["reason"]
+            candidate["model_name"] = model_name
+            self._remember_judged(product, item["candidate_id"])
+
+    def _has_pending_sales(self, product: dict[str, Any]) -> bool:
+        return bool(self._pending_sale_items(product, "search") or self._pending_sale_items(product, "recommendation"))
+
+    def _pending_sale_items(self, product: dict[str, Any], source: str) -> list[dict[str, Any]]:
+        threshold = self.settings.similarity_threshold
+        checked = set(product.get("checked_keys") or [])
+        pool: list[dict[str, Any]] = []
+        if source == "search":
+            pool = list(product.get("listing", {}).get("candidates") or [])
+        else:
+            for match in product.get("matches") or []:
+                if match.get("source") != "search":
+                    continue
+                pool.extend(match.get("ad_candidates") or [])
+        items = []
+        for candidate in pool:
+            if not candidate.get("similar"):
+                continue
+            try:
+                confidence = float(candidate.get("similarity") or 0)
+            except (TypeError, ValueError):
+                confidence = 0
+            if confidence < threshold:
+                continue
+            if candidate.get("key") in checked:
+                continue
+            items.append(
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "similar": True,
+                    "confidence": confidence,
+                    "reason": candidate.get("reason") or "",
+                }
+            )
+        return items
+
+    def _kick_sales_if_idle(self) -> None:
+        with self._state_lock:
+            state = self.state
+            if not state:
+                return
+            product = (state.get("products") or {}).get(state.get("current_product_id") or "")
+            if not product or not product.get("sales_pending") or product.get("sales_running"):
+                return
+            if not self._has_pending_sales(product):
+                product["sales_pending"] = False
+                product["sales_error"] = ""
+                self._commit_locked()
+                return
+            product["sales_running"] = True
+            product["sales_error"] = ""
+            self._commit_locked()
+        self._worker.submit(self._drain_sales)
+
+    def _drain_sales(self) -> None:
+        product_id = ""
+        try:
+            while True:
+                with self._state_lock:
+                    if self.state is None:
+                        return
+                    product = self._current_product()
+                    product_id = str(product.get("product_id") or "")
+                    listing_items = self._pending_sale_items(product, "search")
+                    ad_items = self._pending_sale_items(product, "recommendation")
+                    model_name = ""
+                    for item in listing_items + ad_items:
+                        candidate = self._candidate_index(product).get(item["candidate_id"]) or {}
+                        model_name = str(candidate.get("model_name") or model_name)
+                if not listing_items and not ad_items:
+                    with self._state_lock:
+                        if self.state and product_id in self.state.get("products", {}):
+                            current = self.state["products"][product_id]
+                            current["sales_pending"] = False
+                            current["sales_error"] = ""
+                            self._commit_locked()
+                    return
+                if listing_items:
+                    result = self._open_judged_matches(product, listing_items, model_name, "search", None)
+                    if result.data.get("status") == "needs_human_verification":
+                        return
+                if ad_items:
+                    result = self._open_judged_matches(product, ad_items, model_name, "recommendation", "")
+                    if result.data.get("status") == "needs_human_verification":
+                        return
+        except Exception as exc:
+            log(traceback.format_exc())
+            with self._state_lock:
+                if self.state and product_id in self.state.get("products", {}):
+                    self.state["products"][product_id]["sales_error"] = str(exc)
+                    self._commit_locked()
+            step("销量", f"打开详情中断：{exc}")
+        finally:
+            with self._state_lock:
+                if self.state and product_id in self.state.get("products", {}):
+                    current = self.state["products"][product_id]
+                    current["sales_running"] = False
+                    if not self._has_pending_sales(current):
+                        current["sales_pending"] = False
+                        current["sales_error"] = ""
+                    self._commit_locked()
 
     def _open_ml_detail_with_retry(self, url: str) -> Any:
         browser = self._ensure_browser()
@@ -848,6 +1389,29 @@ class SellerAutoService:
     def _next_ad_batch(self, product_id: str) -> ToolPayload:
         product = self._product(product_id)
         self._require_state()["current_product_id"] = product_id
+        with self._state_lock:
+            replay = _replay_ad_batch(product)
+        if replay is not None:
+            match, batch = replay
+            self._ensure_candidate_files(batch, page_url=match["url"])
+            self._save()
+            images = [(f"参照图 美客多详情主图 parent_url={match['url']}", match.get("image_path") or "")]
+            payload_items = [self._candidate_summary(candidate) for candidate in batch]
+            for candidate in batch:
+                images.append((f"广告图 candidate_id={candidate['candidate_id']} url={candidate['url']}", candidate.get("image_path") or ""))
+            return self._payload(
+                {
+                    "ok": True,
+                    "status": "ad_batch",
+                    "product_id": product["product_id"],
+                    "parent_url": match["url"],
+                    "amazon_title": product.get("title") or "",
+                    "candidates": payload_items,
+                    "title_dropped": [],
+                    "message": "下面是还没判断的同一批广告图。" + self._compare_message("ad", []),
+                },
+                images,
+            )
         for match in product["matches"]:
             if match.get("source") != "search" or match.get("ads_complete"):
                 continue
@@ -915,12 +1479,28 @@ class SellerAutoService:
         browser.pause_ml_read()
         cards = collect_ad_cards(page, browser.pause_ml_scroll)
         log(f"广告位主图 {len(cards)} 张：{public_url(match['url'])}")
-        match["ad_candidates"] = self._ad_candidates(product, match, cards)
+        built = self._ad_candidates(product, match, cards)
+        with self._state_lock:
+            match["ad_candidates"] = built
+            match["ad_next_index"] = 0
+            match["ads_scraped"] = True
+            self._commit_locked()
+        browser.close_detail()
+        return None
+
+    def _fill_listing_ads(self, product: dict[str, Any], match: dict[str, Any], page: Any) -> None:
+        """列表同款详情里抓全量广告。广告商品详情不走这里。"""
+
+        if match.get("ads_scraped"):
+            return
+        browser = self._ensure_browser()
+        page = browser.live_page(page)
+        cards = collect_ad_cards(page, browser.pause_ml_scroll)
+        log(f"广告位主图 {len(cards)} 张：{public_url(match['url'])}")
+        built = self._ad_candidates(product, match, cards)
+        match["ad_candidates"] = built
         match["ad_next_index"] = 0
         match["ads_scraped"] = True
-        browser.close_detail()
-        self._save()
-        return None
 
     def _next_unscraped_ad_match(self, product: dict[str, Any]) -> dict[str, Any] | None:
         for match in product.get("matches") or []:
@@ -962,11 +1542,7 @@ class SellerAutoService:
                     log("保存广告预取状态失败")
 
     def _submit_ad_matches(self, matches: list[Any], model_name: str) -> ToolPayload:
-        product = self._current_product()
-        if not matches:
-            return self._payload({"ok": True, "status": "no_matches", "message": "没有提交广告判断"})
-        payload = self._open_judged_matches(product, matches, model_name, source="recommendation", parent_url="")
-        return self._attach_followup(payload)
+        return self._accept_matches(matches, model_name, "recommendation")
 
     def _open_judged_matches(
         self,
@@ -991,7 +1567,6 @@ class SellerAutoService:
             candidate["reason"] = item["reason"]
             candidate["model_name"] = model_name
             self._remember_judged(product, item["candidate_id"])
-        quiet_skips = 0
         for item in kept:
             candidate = known.get(item["candidate_id"])
             if candidate is None:
@@ -999,13 +1574,13 @@ class SellerAutoService:
             if candidate["key"] in product["checked_keys"]:
                 skipped.append(candidate["candidate_id"])
                 continue
-            action = sales_action(source, candidate["sales_text"] if "sales_text" in candidate else None)
-            if action == "skip":
+            card_text = str(candidate.get("sales_text") or "")
+            if has_sales(card_text) and not can_enter_top(product, card_text):
                 product["checked_keys"].append(candidate["key"])
                 skipped.append(candidate["candidate_id"])
-                quiet_skips += 1
+                step("销量", f"卡片销量挤不进前10，跳过 {card_text} {public_url(candidate['url'])}")
                 continue
-            if action == "record":
+            if source == "recommendation" and has_sales(card_text):
                 self._remember_sale(
                     product,
                     candidate,
@@ -1013,11 +1588,11 @@ class SellerAutoService:
                     source,
                     parent_url,
                     model_name,
-                    candidate.get("sales_text") or "",
+                    card_text,
                     price=candidate.get("price"),
                 )
                 recorded.append(product["matches"][-1])
-                step("销量", f"卡片上已有销量，不打开详情 {candidate.get('sales_text') or ''} {public_url(candidate['url'])}")
+                step("销量", f"广告卡片已有销量，不打开详情 {card_text} {public_url(candidate['url'])}")
                 continue
             browser = self._ensure_browser()
             browser.ml_cooldown.acquire()
@@ -1036,6 +1611,12 @@ class SellerAutoService:
                 self._save()
                 skipped.append(candidate["candidate_id"])
                 continue
+            if not can_enter_top(product, sales["sales_text"]):
+                step("销量", f"详情销量挤不进前10，跳过 {sales['sales_text']} {public_url(candidate['url'])}")
+                browser.close_detail()
+                self._save()
+                skipped.append(candidate["candidate_id"])
+                continue
             image_path = self._download(hero_image_url(page), self._image_stem(candidate["key"]), hero_locator(page), page.url)
             self._remember_sale(
                 product,
@@ -1049,11 +1630,11 @@ class SellerAutoService:
                 read_price(page) or candidate.get("price"),
             )
             recorded.append(product["matches"][-1])
+            if source == "search":
+                self._fill_listing_ads(product, product["matches"][-1], page)
             step("销量", f"有销量，已记录 {sales['sales_text']} {public_url(candidate['url'])}")
             browser.close_detail()
             self._save()
-        if quiet_skips:
-            step("销量", f"卡片上没有 vendido，跳过 {quiet_skips} 条，没有打开详情")
         self._save()
         return self._payload(
             {
@@ -1109,33 +1690,72 @@ class SellerAutoService:
         )
 
     def _attach_followup(self, payload: ToolPayload) -> ToolPayload:
-        """把下一批要看的图放进同一次返回，避免再单独走一步 MCP。"""
+        """把下一步要看的图或下一张主图放进同一次返回。"""
 
         data = payload.data
         step_name = data.get("next_step")
-        product_id = data.get("product_id")
-        if step_name == "next_listing_batch":
+        product_id = str(data.get("product_id") or "")
+        if step_name in {"next_listing_batch", "submit_listing_matches"}:
             follow = self._next_listing_batch()
             if follow.data.get("status") == "listing_batch":
                 follow.data["message"] = (
-                    "上一批销量已处理。下面是下一批列表图。"
+                    "下面是下一批列表图。"
                     + self._compare_message("listing", follow.data.get("title_dropped") or [])
                 )
+                return follow
+            if follow.data.get("status") == "needs_human_verification":
                 return follow
             payload = follow
             data = payload.data
             step_name = data.get("next_step")
-        if step_name == "next_ad_batch" and product_id:
+            product_id = str(data.get("product_id") or product_id)
+        if step_name in {"next_ad_batch", "submit_ad_matches"} and product_id:
             follow = self._next_ad_batch(product_id)
             if follow.data.get("status") == "ad_batch":
                 follow.data["message"] = (
-                    "下面是下一条有销量详情的广告图。"
+                    "下面是下一批广告图。"
                     + self._compare_message("ad", follow.data.get("title_dropped") or [])
                 )
                 return follow
-            return follow
+            if follow.data.get("status") == "needs_human_verification":
+                return follow
+            payload = follow
+            data = payload.data
+            step_name = data.get("next_step")
+            product_id = str(data.get("product_id") or product_id)
+        if step_name == "export_results":
+            return self._handoff_finished(product_id)
         data["message"] = self._step_message(str(data.get("message") or ""), str(data.get("next_step") or ""))
         return payload
+
+    def _handoff_finished(self, product_id: str) -> ToolPayload:
+        """列表和广告都结束后自己写表。整店接着打开下一条。"""
+
+        waiting = self._sales_wait_payload(product_id, "")
+        if waiting is not None:
+            return waiting
+        self._start_export()
+        state = self._require_state()
+        if state.get("single_product") or state.get("amazon_done"):
+            return self._payload(
+                {
+                    "ok": True,
+                    "status": "finished",
+                    "product_id": product_id,
+                    "next_step": "done",
+                    "message": "这一条已经筛完，表格在后台写入。不要再调用 export_results 或 next_amazon_product。",
+                }
+            )
+        opened = self._next_amazon_product()
+        if opened.data.get("status") == "amazon_product":
+            opened.data["message"] = (
+                "下一条亚马逊商品已打开。请直接 set_keywords。"
+                "上一条的表格在后台写入，不要调用 export_results。"
+                "卖家精灵和货源查询已在后台开始，不要等它们。"
+            )
+        elif opened.data.get("status") == "end_of_store":
+            opened.data["message"] = "店铺列表已经读完。表格在后台写入，不要再调用 export_results 或 next_amazon_product。"
+        return opened
 
     def _step_message(self, done: str, step_name: str) -> str:
         hints = {
@@ -1224,6 +1844,10 @@ class SellerAutoService:
         browser.scroll_down(browser.list_page, 5, browser.pause_ml_scroll)
 
     def _add_candidates(self, product: dict[str, Any], cards: list[dict[str, str]], page_no: int) -> None:
+        with self._state_lock:
+            self._add_candidates_locked(product, cards, page_no)
+
+    def _add_candidates_locked(self, product: dict[str, Any], cards: list[dict[str, str]], page_no: int) -> None:
         listing = product["listing"]
         existing = {item["key"] for item in listing["candidates"]}
         checked = set(product["checked_keys"])
@@ -1249,11 +1873,12 @@ class SellerAutoService:
 
     def _take_candidates(self, product: dict[str, Any]) -> list[dict[str, Any]]:
         listing = product["listing"]
-        batch, next_index, dropped = self._select_image_batch(
-            product, listing["candidates"], int(listing["next_index"])
-        )
-        listing["next_index"] = next_index
-        listing["title_dropped"] = dropped
+        with self._state_lock:
+            batch, next_index, dropped = self._select_image_batch(
+                product, listing["candidates"], int(listing["next_index"])
+            )
+            listing["next_index"] = next_index
+            listing["title_dropped"] = dropped
         if batch:
             self._ensure_candidate_files(batch, page_url=product["ml_search_url"])
         self._save()
@@ -1302,11 +1927,19 @@ class SellerAutoService:
         return (
             f"{skipped}请先对照亚马逊标题再看剩下的候选标题。"
             "标题已经能明显看出不是同一商品的，直接记 similar=false，不要进图片对比。"
-            "剩下的再看图：颜色不同也可以算同款；外形、结构和整体构图高度相似则为 true，外形明显不同才是 false。"
+            "标题对得上的，先看本批已经返回的图：包装、折叠、带脚整机、生活场景、只拍局部、装套演示等构图已经明显不同的，主代理直接记 similar=false，不要交给看图子代理。"
+            "只有外形对得上或拿不准的，再按每 4 张切一组看图。没有拿不准的就直接提交，不要为了凑组开子代理。"
+            "颜色不同也可以算同款；外形、结构和整体构图高度相似则为 true，外形明显不同才是 false。"
             f"判断完再调用 {submit}。"
         )
 
-    def _candidate_payload(self, product: dict[str, Any], batch: list[dict[str, Any]], status: str) -> ToolPayload:
+    def _candidate_payload(
+        self,
+        product: dict[str, Any],
+        batch: list[dict[str, Any]],
+        status: str,
+        lead: str = "",
+    ) -> ToolPayload:
         reference = product.get("image_path") or ""
         images = [(f"参照图 亚马逊主图 product_id={product['product_id']}", reference)]
         summaries = []
@@ -1324,7 +1957,7 @@ class SellerAutoService:
                 "amazon_title": product.get("title") or "",
                 "candidates": summaries,
                 "title_dropped": dropped,
-                "message": self._compare_message("listing", dropped),
+                "message": f"{lead}{self._compare_message('listing', dropped)}",
             },
             images,
         )
@@ -1442,6 +2075,25 @@ class _Blocked(Exception):
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__(NEEDS_HUMAN)
         self.payload = payload
+
+
+def _unjudged_delivered(candidates: list[dict[str, Any]], cursor: Any, judged_ids: Any) -> list[dict[str, Any]]:
+    judged = set(judged_ids or [])
+    sent = list(candidates or [])[: int(cursor or 0)]
+    return [item for item in sent if item.get("candidate_id") not in judged]
+
+
+def _replay_ad_batch(product: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    judged = set(product.get("judged_ids") or [])
+    for match in product.get("matches") or []:
+        if match.get("source") != "search":
+            continue
+        candidates = list(match.get("ad_candidates") or [])
+        cursor = len(candidates) if match.get("ads_complete") else int(match.get("ad_next_index") or 0)
+        pending = [item for item in candidates[:cursor] if item.get("candidate_id") not in judged]
+        if pending:
+            return match, pending[:BATCH_SIZE]
+    return None
 
 
 def _top_links(product: dict[str, Any]) -> list[dict[str, Any]]:

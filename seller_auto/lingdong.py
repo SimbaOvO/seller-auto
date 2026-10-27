@@ -1,4 +1,4 @@
-"""用整理好的美客多链接去蓝鲸选品查 30 天销量，并按运费表计算尾程运费。"""
+"""用整理好的美客多链接去蓝鲸选品查 30 天销量。尾程运费另按包装和最低售价计算。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 
 from seller_auto.step_log import step
 from seller_auto.storage import public_url
-from seller_auto.workbook import dimension_cm, ranked_matches, weight_kg
+from seller_auto.workbook import dimension_cm, lowest_selling_price, ranked_matches, weight_kg
 
 ALL_ITEMS_URL = "https://xp.lingdongsz.com/#/allItems"
 _VIEWPORT = {"width": 1600, "height": 1000}
@@ -61,8 +61,17 @@ _PRICE_BANDS = (
 
 _GATE_JS = r"""
 () => {
-  const labels = [...document.querySelectorAll("span.label")];
-  if (labels.some((el) => (el.textContent || "").trim() === "商品链接")) return "ready";
+  const shown = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    return style.display !== "none" && style.visibility !== "hidden" && el.getClientRects().length > 0;
+  };
+  const label = [...document.querySelectorAll("span.label")].find((el) => (el.textContent || "").trim() === "商品链接");
+  let node = label;
+  for (let i = 0; i < 6 && node; i += 1) {
+    if ([...node.querySelectorAll("input, textarea")].some(shown)) return "ready";
+    node = node.parentElement;
+  }
   const hash = location.hash || "";
   const password = document.querySelector('input[type="password"]');
   if (hash.includes("/login") || (password && password.getClientRects().length > 0)) return "login";
@@ -138,14 +147,25 @@ _SET_VALUE_JS = r"""
 }
 """
 
-_SELECT_MLA_JS = r"""
+# 商品链接是单行输入框，一次填一条美客多地址。一批查完再查下一批。
+LINK_BATCH_SIZE = 5
+
+_STATUS_ALL_JS = r"""
 () => {
-  const radio = [...document.querySelectorAll('input[type="radio"]')].find((el) => el.value === "MLA");
-  if (!radio) return "missing";
-  if (radio.checked) return "ready";
-  const label = radio.closest("label");
-  (label || radio).click();
-  return "clicked";
+  const label = [...document.querySelectorAll("span.label")].find((el) => (el.textContent || "").trim() === "商品状态");
+  let node = label;
+  for (let i = 0; i < 6 && node; i += 1) {
+    const option = [...node.querySelectorAll("label.el-radio")].find((el) => {
+      return [...el.querySelectorAll(".el-radio__label")].some((item) => (item.textContent || "").trim() === "全部");
+    });
+    if (option) {
+      if (option.classList.contains("is-checked")) return "ready";
+      option.click();
+      return "clicked";
+    }
+    node = node.parentElement;
+  }
+  return "missing";
 }
 """
 
@@ -173,6 +193,24 @@ def parse_ars_amount(text: str) -> int | float | None:
     if number.is_integer():
         return int(number)
     return float(number)
+
+
+def apply_last_mile(product: dict[str, Any]) -> int | None:
+    """用卖家精灵的重量、长宽高，和前 10 条同款的最低售价，记下尾程运费。"""
+
+    package = product.get("package_size")
+    if not package_fields(package):
+        return None
+    price = lowest_selling_price(ranked_matches(product))
+    if price is None:
+        return None
+    kilograms = chargeable_kilograms({}, package)
+    fee = last_mile_fee(kilograms, price)
+    if fee is None:
+        return None
+    product["fba_fee"] = fee
+    step("运费", f"计费重量 {kilograms:.3f} kg，最低售价 {price:g}，尾程运费 {fee}")
+    return fee
 
 
 def last_mile_fee(weight_kg: float, price: float) -> int | None:
@@ -225,6 +263,14 @@ def chargeable_kilograms(row: dict[str, Any], package: dict[str, Any] | None) ->
     if length > 0 and width > 0 and height > 0:
         volume = length * width * height / MLA_VOLUME_DIVISOR
     return max(weight, volume)
+
+
+def link_batches(links: list[str], size: int = LINK_BATCH_SIZE) -> list[list[str]]:
+    """商品链接按批切开。每批里的地址仍逐条填入。"""
+
+    step_size = size if size > 0 else LINK_BATCH_SIZE
+    cleaned = [url for url in links if url]
+    return [cleaned[index:index + step_size] for index in range(0, len(cleaned), step_size)]
 
 
 def quote_links(product: dict[str, Any]) -> list[str]:
@@ -391,16 +437,6 @@ def _rates_for_weight(kilograms: float) -> tuple[int, ...]:
     return _RATE_TABLE[0][2]
 
 
-def _positive_price(row: dict[str, Any]) -> float | None:
-    try:
-        price = float(row.get("price"))
-    except (TypeError, ValueError):
-        return None
-    if price <= 0:
-        return None
-    return price
-
-
 def _centimeters(value: Any) -> float | None:
     text = str(value or "").strip().lower()
     match = _NUMBER.search(text)
@@ -486,29 +522,39 @@ def _open_page(browser: Any) -> Any:
 
 def _prepare(page: Any) -> None:
     page.evaluate(_HOOK_JS)
-    _select_mla(page)
     reset = _reset_button(page)
     if reset.count():
         reset.first.click()
         page.wait_for_timeout(500)
-    _select_mla(page)
+    _select_all_status(page)
     _wait_idle(page)
     page.evaluate(_HOOK_JS)
 
 
-def _select_mla(page: Any) -> None:
-    clicked = page.evaluate(_SELECT_MLA_JS)
+def _select_all_status(page: Any) -> None:
+    clicked = page.evaluate(_STATUS_ALL_JS)
+    if clicked == "ready":
+        step("蓝鲸", "商品状态已是全部")
+        return
     if clicked == "missing":
-        raise LingdongError("页面上没有阿根廷站点")
-    if clicked == "clicked":
-        page.wait_for_function(
-            """() => {
-              const radio = [...document.querySelectorAll('input[type="radio"]')].find((el) => el.value === "MLA");
-              const ready = [...document.querySelectorAll("span.label")].some((el) => (el.textContent || "").trim() === "商品链接");
-              return !!(radio && radio.checked && ready);
-            }""",
-            timeout=15000,
-        )
+        step("蓝鲸", "没有找到商品状态的全部")
+        return
+    page.wait_for_function(
+        """() => {
+          const label = [...document.querySelectorAll("span.label")].find((el) => (el.textContent || "").trim() === "商品状态");
+          let node = label;
+          for (let i = 0; i < 6 && node; i += 1) {
+            const option = [...node.querySelectorAll("label.el-radio")].find((el) => {
+              return [...el.querySelectorAll(".el-radio__label")].some((item) => (item.textContent || "").trim() === "全部");
+            });
+            if (option) return option.classList.contains("is-checked");
+            node = node.parentElement;
+          }
+          return false;
+        }""",
+        timeout=8000,
+    )
+    step("蓝鲸", "商品状态已选择全部")
 
 
 def _wait_idle(page: Any) -> None:
@@ -548,22 +594,22 @@ def _reset_button(page: Any) -> Any:
 
 def _quote_on_page(page: Any, links: list[str], package: dict[str, Any] | None) -> dict[str, Any]:
     hits: list[dict[str, Any]] = []
-    for url in links:
-        row = _search_row(page, url)
-        if row is None:
-            step("蓝鲸", f"没有对应商品行：{item_id(url) or url}")
-            continue
-        row["source_url"] = url
-        hits.append(row)
-        step("蓝鲸", f"{row.get('id') or item_id(url)} 30天销量 {row.get('sale30')}")
-        page.wait_for_timeout(400)
+    for index, batch in enumerate(link_batches(links), start=1):
+        step("蓝鲸", f"第 {index} 批商品链接，共 {len(batch)} 条")
+        for url in batch:
+            row = _search_row(page, url)
+            if row is None:
+                step("蓝鲸", f"没有对应商品行：{item_id(url) or url}")
+                continue
+            row["source_url"] = url
+            hits.append(row)
+            step("蓝鲸", f"{row.get('id') or item_id(url)} 30天销量 {row.get('sale30')}")
+            page.wait_for_timeout(400)
+    _ = package
     orders = total_orders(hits)
-    fee = _fee_for_hits(hits, package)
-    if orders is not None or fee is not None:
-        orders_text = orders if orders is not None else "无"
-        fee_text = fee if fee is not None else "无"
-        step("蓝鲸", f"30天合计 {orders_text}，尾程运费 {fee_text}")
-    return {"orders": orders, "fba_fee": fee}
+    if orders is not None:
+        step("蓝鲸", f"30天合计 {orders}")
+    return {"orders": orders}
 
 
 def _search_row(page: Any, url: str) -> dict[str, Any] | None:
@@ -607,15 +653,3 @@ def _search_row(page: Any, url: str) -> dict[str, Any] | None:
     return _matching_row(state.get("rows") or [], url)
 
 
-def _fee_for_hits(hits: list[dict[str, Any]], package: dict[str, Any] | None) -> int | None:
-    target = choose_quote_row(hits)
-    if target is None:
-        return None
-    price = _positive_price(target)
-    if price is None:
-        return None
-    kilograms = chargeable_kilograms(target, package)
-    fee = last_mile_fee(kilograms, price)
-    label = item_id(str(target.get("id") or "")) or item_id(str(target.get("source_url") or ""))
-    step("蓝鲸", f"{label or '最低价链接'} 售价 {price:g}，计费重量 {kilograms:.3f} kg，尾程运费 {fee}")
-    return fee

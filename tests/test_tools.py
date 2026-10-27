@@ -13,6 +13,7 @@ from seller_auto.storage import (
     atomic_write_json,
     build_export,
     discard_finished_images,
+    discard_product_images,
     find_state_by_session,
     load_json,
 )
@@ -55,8 +56,14 @@ class ToolContractTests(unittest.TestCase):
         self.assertIn("并行", INSTRUCTIONS)
         self.assertIn("标题", INSTRUCTIONS)
         self.assertIn("不要进图片对比", INSTRUCTIONS)
+        self.assertIn("不要交给看图子代理", INSTRUCTIONS)
+        self.assertIn("不要为了凑组开子代理", INSTRUCTIONS)
+        self.assertIn("挤不进前 10", INSTRUCTIONS)
         self.assertIn("chinese_name", tools["set_keywords"].parameters["properties"])
         self.assertIn(INSTRUCTIONS, server.instructions or "")
+        hint = SellerAutoService(DelaySettings(), output_dir=tempfile.mkdtemp())._compare_message("listing", [])
+        self.assertIn("不要交给看图子代理", hint)
+        self.assertIn("不要为了凑组开子代理", hint)
 
     def test_image_blocks_stay_images(self) -> None:
         from PIL import Image
@@ -179,6 +186,26 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(load_json(path)["session_id"], "sess-1")
             self.assertEqual(find_state_by_session(root, "sess-1"), path)
             self.assertIsNone(find_state_by_session(root, "missing"))
+
+    def test_finished_asin_drops_only_its_own_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images = root / "images"
+            images.mkdir()
+            kept = images / "next.jpg"
+            done = images / "done.jpg"
+            kept.write_bytes(b"next")
+            done.write_bytes(b"done")
+            removed = discard_product_images(
+                {
+                    "image_path": str(done),
+                    "listing": {"candidates": [{"image_path": str(done)}]},
+                    "matches": [{"image_path": "", "ad_candidates": []}],
+                }
+            )
+            self.assertEqual(removed, 1)
+            self.assertFalse(done.exists())
+            self.assertTrue(kept.is_file())
 
     def test_finished_export_drops_images_and_keeps_an_open_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 import re
+from copy import copy
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment, PatternFill
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
 from openpyxl.utils import column_index_from_string, get_column_letter
@@ -104,6 +106,27 @@ def ranked_matches(product: dict[str, Any], limit: int = MKD_LINK_COUNT) -> list
     return rows[:limit]
 
 
+def sales_cutoff(product: dict[str, Any], limit: int = MKD_LINK_COUNT) -> int | None:
+    """同款销量已满 limit 条时，返回第 limit 名的销量；未满则没有门槛。"""
+
+    rows = [item for item in product.get("matches") or [] if item.get("url")]
+    if len(rows) < limit:
+        return None
+    top = ranked_matches(product, limit)
+    if len(top) < limit:
+        return None
+    return sales_count(str(top[-1].get("sales_text") or ""))
+
+
+def can_enter_top(product: dict[str, Any], sales_text: str, limit: int = MKD_LINK_COUNT) -> bool:
+    """已记录同款是否挤得进销量前 10。写表取前 10 时用。"""
+
+    cutoff = sales_cutoff(product, limit)
+    if cutoff is None:
+        return True
+    return sales_count(sales_text) >= cutoff
+
+
 def order_count(product: dict[str, Any]) -> int | None:
     """名称里「xx单」的数量，同时写入预计数量。"""
 
@@ -120,14 +143,13 @@ def order_count(product: dict[str, Any]) -> int | None:
 
 
 def display_name(product: dict[str, Any]) -> str:
-    """名称列。蓝鲸查到 30 天销量后写成「xxx商品（xx单）」。"""
+    """名称列。蓝鲸查到 30 天销量后，单量写在同一格的下一行。"""
 
     name = (product.get("chinese_name") or "").strip()
     count = order_count(product)
     if count is None:
         return name
-    base = name if name.endswith("商品") else f"{name}商品"
-    return f"{base}（{count}单）"
+    return f"{name}\n（{count}单）"
 
 
 def fba_amount(raw: Any) -> int | float | None:
@@ -384,12 +406,51 @@ def _write_row(
         if value in (None, ""):
             continue
         sheet.cell(row, column, value)
+    _style_filled_columns(sheet, source_row, row, roles)
     for column, match in zip(mkd_columns, top):
         url = public_url(str(match.get("url") or ""), str(match.get("key") or match.get("candidate_id") or ""))
         if url:
             sheet.cell(row, column, url)
+    _center_row(sheet, row, roles, mkd_columns)
     _embed_listing_image(sheet, row, roles.get("listing"), product.get("image_path") or "")
     sheet.row_dimensions[row].height = LISTING_ROW_HEIGHT
+
+
+def _center_row(sheet: Worksheet, row: int, roles: dict[str, int], mkd_columns: list[int]) -> None:
+    name_column = roles.get("name")
+    for column in list(roles.values()) + list(mkd_columns):
+        cell = sheet.cell(row, column)
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=column == name_column,
+        )
+
+
+def _earlier_fill(sheet: Worksheet, row: int, column: int):
+    for source in range(row - 1, 1, -1):
+        fill = sheet.cell(source, column).fill
+        if fill and fill.patternType:
+            return fill
+    return None
+
+
+def _style_filled_columns(sheet: Worksheet, source_row: int | None, row: int, roles: dict[str, int]) -> None:
+    """采购成本和 FBA 运费沿用表格里已有的底色。投产比不填色。"""
+
+    _ = source_row
+    for role in ("cost", "fba"):
+        column = roles.get(role)
+        if not column:
+            continue
+        fill = _earlier_fill(sheet, row, column)
+        if fill is not None:
+            sheet.cell(row, column).fill = copy(fill)
+    roi = roles.get("roi")
+    if roi:
+        cell = sheet.cell(row, roi)
+        cell.fill = PatternFill(fill_type=None)
+        cell.number_format = "0.00%"
 
 
 def _embed_listing_image(sheet: Worksheet, row: int, column: int | None, image_path: str) -> None:

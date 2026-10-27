@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -10,10 +11,12 @@ from openpyxl import Workbook, load_workbook
 from seller_auto.lingdong import (
     _GATE_JS,
     _TABLE_JS,
+    apply_last_mile,
     chargeable_kilograms,
     choose_quote_row,
     item_id,
     last_mile_fee,
+    link_batches,
     package_fields,
     parse_ars_amount,
     quote_links,
@@ -36,6 +39,16 @@ def _chrome_for_testing() -> str:
     return str(matches[-1])
 
 
+def _wait_export(service: object) -> dict:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        result = (getattr(service, "state", None) or {}).get("export_result") or {}
+        if result.get("message"):
+            return result
+        time.sleep(0.05)
+    raise AssertionError("导出没有在预期时间内写完")
+
+
 def _workbook(path: Path) -> None:
     workbook = Workbook()
     sheet = workbook.active
@@ -51,6 +64,13 @@ class LingdongParseTests(unittest.TestCase):
         self.assertEqual(parse_ars_amount("尾程运费 ¥11.98 ARS2,740.00 其他成本"), 2740)
         self.assertEqual(parse_ars_amount("ARS 0"), 0)
         self.assertIsNone(parse_ars_amount("请选择"))
+
+    def test_links_are_split_into_batches(self) -> None:
+        links = [f"https://www.mercadolibre.com.ar/p/MLA{index}" for index in range(7)]
+        batches = link_batches(links, size=5)
+        self.assertEqual([len(batch) for batch in batches], [5, 2])
+        self.assertEqual(link_batches(["", "https://example.com/a"]), [["https://example.com/a"]])
+        self.assertEqual(link_batches([]), [])
 
     def test_rate_table_matches_the_calculator(self) -> None:
         self.assertEqual(last_mile_fee(0.22, 22425), 2740)
@@ -88,8 +108,8 @@ class LingdongParseTests(unittest.TestCase):
 
     def test_name_and_package_use_the_sheet_units(self) -> None:
         self.assertEqual(display_name({"chinese_name": "硅胶灶台缝隙盖"}), "硅胶灶台缝隙盖")
-        self.assertEqual(display_name({"chinese_name": "硅胶灶台缝隙盖", "market_orders": 50}), "硅胶灶台缝隙盖商品（50单）")
-        self.assertEqual(display_name({"chinese_name": "硅胶商品", "market_orders": 0}), "硅胶商品（0单）")
+        self.assertEqual(display_name({"chinese_name": "硅胶灶台缝隙盖", "market_orders": 50}), "硅胶灶台缝隙盖\n（50单）")
+        self.assertEqual(display_name({"chinese_name": "硅胶商品", "market_orders": 0}), "硅胶商品\n（0单）")
         fields = package_fields(
             {"length": "21.4", "width": "7.8", "height": "0.6", "unit": "cm", "weight": "213", "weight_unit": "g"}
         )
@@ -143,10 +163,13 @@ class LingdongExportTests(unittest.TestCase):
             state = _new_state("sess", "SELLER1", "https://www.amazon.com.mx/s?me=SELLER1")
             state["single_product"] = "B0TEST1234"
             state["product_order"] = ["B0TEST1234"]
+            state["current_product_id"] = "B0TEST1234"
             state["products"]["B0TEST1234"] = {
                 "product_id": "B0TEST1234",
                 "chinese_name": "硅胶灶台缝隙盖",
                 "keywords": "cubiertas",
+                "listing": {"page1_done": True, "page2_done": True, "candidates": [], "next_index": 0},
+                "judged_ids": [],
                 "package_size": {
                     "length": "21.4",
                     "width": "7.8",
@@ -183,9 +206,10 @@ class LingdongExportTests(unittest.TestCase):
                 return "蓝鲸选品已把 30 天销量写入名称，并把尾程运费写入 FBA 运费。"
 
             service._run_market_quotes = fake
-            payload = service.export_results()
-            self.assertTrue(payload.data["ok"])
-            self.assertIn("30 天销量", payload.data["message"])
+            service.export_results()
+            payload_data = _wait_export(service)
+            self.assertTrue(payload_data["ok"])
+            self.assertIn("30 天销量", payload_data["message"])
             self.assertEqual(seen["jobs"][0]["package"]["weight"], "213")
             self.assertEqual(
                 seen["jobs"][0]["links"],
@@ -195,8 +219,67 @@ class LingdongExportTests(unittest.TestCase):
                 ],
             )
             sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
-            self.assertEqual(sheet.cell(2, 1).value, "硅胶灶台缝隙盖商品（80单）")
+            self.assertEqual(sheet.cell(2, 1).value, "硅胶灶台缝隙盖\n（80单）")
             self.assertEqual(sheet.cell(2, 2).value, 2740)
+
+    def test_package_freight_is_recorded_when_lingdong_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook_path = root / "book.xlsx"
+            _workbook(workbook_path)
+            service = SellerAutoService(DelaySettings(), output_dir=str(root), workbook_path=str(workbook_path))
+            state = _new_state("sess", "SELLER1", "https://www.amazon.com.mx/s?me=SELLER1")
+            state["single_product"] = "B0TEST1234"
+            state["product_order"] = ["B0TEST1234"]
+            state["current_product_id"] = "B0TEST1234"
+            product = {
+                "product_id": "B0TEST1234",
+                "chinese_name": "烫衣板套",
+                "keywords": "funda",
+                "listing": {"page1_done": True, "page2_done": True, "candidates": [], "next_index": 0},
+                "judged_ids": [],
+                "package_size": {
+                    "length": "33",
+                    "width": "27.1",
+                    "height": "8.7",
+                    "unit": "cm",
+                    "weight": "260",
+                    "weight_unit": "g",
+                },
+                "matches": [
+                    {
+                        "candidate_id": "low",
+                        "url": "https://www.mercadolibre.com.ar/p/MLA45199092",
+                        "sales_text": "+500 vendidos",
+                        "price": 12400,
+                        "confidence": 0.95,
+                    },
+                    {
+                        "candidate_id": "high",
+                        "url": "https://www.mercadolibre.com.ar/p/MLA856699073",
+                        "sales_text": "+1000 vendidos",
+                        "price": 19989,
+                        "confidence": 0.95,
+                    },
+                ],
+            }
+            state["products"]["B0TEST1234"] = product
+            service.state = state
+            service._save()
+            self.assertEqual(apply_last_mile(product), 1430)
+
+            def fake(jobs: list[dict]) -> str:
+                raise RuntimeError(f"页面上没有阿根廷站点 {jobs}")
+
+            service._run_market_quotes = fake
+            service.export_results()
+            payload_data = _wait_export(service)
+            self.assertTrue(payload_data["ok"])
+            self.assertIn("单量这次没写", payload_data["message"])
+            self.assertIn("尾程运费已按包装和最低售价写入 FBA 运费", payload_data["message"])
+            sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(2, 1).value, "烫衣板套")
+            self.assertEqual(sheet.cell(2, 2).value, 1430)
 
     def test_export_without_links_skips_lingdong(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -206,10 +289,13 @@ class LingdongExportTests(unittest.TestCase):
             service = SellerAutoService(DelaySettings(), output_dir=str(root), workbook_path=str(workbook_path))
             state = _new_state("sess", "SELLER1", "https://www.amazon.com.mx/s?me=SELLER1")
             state["product_order"] = ["B0TEST1234"]
+            state["current_product_id"] = "B0TEST1234"
             state["products"]["B0TEST1234"] = {
                 "product_id": "B0TEST1234",
                 "chinese_name": "硅胶灶台缝隙盖",
                 "keywords": "cubiertas",
+                "listing": {"page1_done": True, "page2_done": True, "candidates": [], "next_index": 0},
+                "judged_ids": [],
                 "matches": [],
             }
             service.state = state
@@ -219,12 +305,80 @@ class LingdongExportTests(unittest.TestCase):
                 raise AssertionError(jobs)
 
             service._run_market_quotes = fake
-            payload = service.export_results()
-            self.assertTrue(payload.data["ok"])
-            self.assertNotIn("蓝鲸", payload.data["message"])
-            self.assertIn("没有同款，没有写入表格", payload.data["message"])
+            service.export_results()
+            payload_data = _wait_export(service)
+            self.assertTrue(payload_data["ok"])
+            self.assertNotIn("蓝鲸", payload_data["message"])
+            self.assertIn("没有同款，没有写入表格", payload_data["message"])
             sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
             self.assertIsNone(sheet.cell(2, 1).value)
+
+
+    def test_each_finished_asin_is_appended_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook_path = root / "book.xlsx"
+            _workbook(workbook_path)
+            service = SellerAutoService(DelaySettings(), output_dir=str(root), workbook_path=str(workbook_path))
+            state = _new_state("sess", "SELLER1", "https://www.amazon.com.mx/s?me=SELLER1")
+            state["current_product_id"] = "B0FIRST000"
+            state["product_order"] = ["B0FIRST000", "B0SECOND00"]
+            state["products"]["B0FIRST000"] = _asin("折叠购物车", "carrito", "https://www.mercadolibre.com.ar/p/MLA1")
+            second = _asin("硅胶灶台缝隙盖", "cubiertas", "https://www.mercadolibre.com.ar/p/MLA2")
+            second["listing"] = {"page1_done": False, "page2_done": False, "candidates": [], "next_index": 0}
+            state["products"]["B0SECOND00"] = second
+            service.state = state
+            service._save()
+            seen: list[list[str]] = []
+
+            def fake(jobs: list[dict]) -> str:
+                seen.append([job["product_id"] for job in jobs])
+                for job in jobs:
+                    service.state["products"][job["product_id"]]["market_orders"] = 10
+                return "蓝鲸选品已把 30 天销量写入名称。"
+
+            service._run_market_quotes = fake
+            service.export_results()
+            _wait_export(service)
+            sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(2, 1).value, "折叠购物车\n（10单）")
+            self.assertIsNone(sheet.cell(3, 1).value)
+            self.assertEqual(seen, [["B0FIRST000"]])
+            self.assertTrue(service.state["products"]["B0FIRST000"]["workbook_written"])
+            self.assertFalse(service.state["products"]["B0SECOND00"].get("workbook_written"))
+
+            second["listing"] = {"page1_done": True, "page2_done": True, "candidates": [], "next_index": 0}
+            service.state["current_product_id"] = "B0SECOND00"
+            service._save()
+            service.export_results()
+            _wait_export(service)
+            sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(2, 1).value, "折叠购物车\n（10单）")
+            self.assertEqual(sheet.cell(3, 1).value, "硅胶灶台缝隙盖\n（10单）")
+            self.assertEqual(seen[1], ["B0SECOND00"])
+
+            service.export_results()
+            sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
+            self.assertIsNone(sheet.cell(4, 1).value)
+            self.assertEqual(len(seen), 2)
+
+
+def _asin(name: str, keywords: str, url: str) -> dict:
+    return {
+        "chinese_name": name,
+        "keywords": keywords,
+        "listing": {"page1_done": True, "page2_done": True, "candidates": [], "next_index": 0},
+        "judged_ids": [],
+        "matches": [
+            {
+                "candidate_id": "match",
+                "url": url,
+                "sales_text": "+10 vendidos",
+                "price": 18000,
+                "confidence": 0.95,
+            }
+        ],
+    }
 
 
 class LingdongPageTests(unittest.TestCase):
@@ -262,6 +416,7 @@ class LingdongPageTests(unittest.TestCase):
             try:
                 page = browser.new_page()
                 page.set_content(page_html)
+                self.assertEqual(page.evaluate(_GATE_JS), "ready")
                 page.evaluate(
                     """() => {
                       document.querySelector('#grid').__vueParentComponent = {
@@ -281,8 +436,8 @@ class LingdongPageTests(unittest.TestCase):
                 self.assertEqual(link.get_attribute("id"), "link-box")
                 page.evaluate("() => { location.hash = '#/login'; document.body.innerHTML = '<input type=\"password\">'; }")
                 self.assertEqual(page.evaluate(_GATE_JS), "login")
-                page.set_content("<span class='label'>商品链接</span>")
-                self.assertEqual(page.evaluate(_GATE_JS), "ready")
+                page.evaluate("() => { location.hash = ''; document.body.innerHTML = '<span class=\"label\">商品链接</span>'; }")
+                self.assertIsNone(page.evaluate(_GATE_JS))
             finally:
                 browser.close()
 

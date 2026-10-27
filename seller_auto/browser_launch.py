@@ -105,18 +105,24 @@ def persistent_context_options(
     *,
     headless: bool,
     chrome_version: str | None = None,
+    locale: str = "es-AR",
+    accept_language: str = "es-AR,es;q=0.9",
+    timezone_id: str = "America/Argentina/Buenos_Aires",
+    geolocation: dict[str, float] | None = None,
 ) -> dict[str, Any]:
+    args = [item for item in LAUNCH_ARGS if not item.startswith("--lang=")]
+    args.append(f"--lang={locale}")
     options: dict[str, Any] = {
         "user_data_dir": str(profile_dir.resolve()),
         "headless": headless,
-        "locale": "es-AR",
-        "timezone_id": "America/Argentina/Buenos_Aires",
-        "geolocation": {"latitude": -34.6037, "longitude": -58.3816},
+        "locale": locale,
+        "timezone_id": timezone_id,
+        "geolocation": geolocation or {"latitude": -34.6037, "longitude": -58.3816},
         "permissions": ["geolocation"],
         "viewport": {"width": 1440, "height": 900},
-        "extra_http_headers": {"Accept-Language": "es-AR,es;q=0.9"},
+        "extra_http_headers": {"Accept-Language": accept_language},
         "ignore_default_args": ["--enable-automation"],
-        "args": list(LAUNCH_ARGS),
+        "args": args,
     }
     if headless:
         # 不传 channel 时，Playwright 会改用精简的 headless shell。

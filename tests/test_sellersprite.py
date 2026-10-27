@@ -59,6 +59,106 @@ TABLE_HTML = """
 </div>
 """
 
+RENAMED_COLUMN_HTML = """
+<div class="el-table">
+  <div class="el-table__header-wrapper">
+    <table class="el-table__header"><thead><tr>
+      <th class="el-table_1_column_1"><div class="cell">商品</div></th>
+      <th class="el-table_1_column_2"><div class="cell">包装重量<br>包装尺寸</div></th>
+      <th class="el-table_1_column_3"><div class="cell">商品重量<br>商品尺寸</div></th>
+    </tr></thead></table>
+  </div>
+  <div class="el-table__body-wrapper">
+    <table class="el-table__body"><tbody>
+      <tr class="el-table__row">
+        <td class="el-table_1_column_1"><div class="cell">B0CF1W16JG 黑胶唱片保护套</div></td>
+        <td class="el-table_1_column_2"><div class="cell">-</div></td>
+        <td class="el-table_1_column_3"><div class="cell">760 g<br>37.1 × 33.4 × 1.3 cm</div></td>
+      </tr>
+    </tbody></table>
+  </div>
+</div>
+"""
+
+PACKAGE_WINS_HTML = """
+<div class="el-table">
+  <div class="el-table__header-wrapper">
+    <table class="el-table__header"><thead><tr>
+      <th class="el-table_3_column_1"><div class="cell">商品</div></th>
+      <th class="el-table_3_column_2"><div class="cell">商品重量<br>商品尺寸</div></th>
+      <th class="el-table_3_column_3"><div class="cell">包装重量<br>包装尺寸</div></th>
+    </tr></thead></table>
+  </div>
+  <div class="el-table__body-wrapper">
+    <table class="el-table__body"><tbody>
+      <tr class="el-table__row">
+        <td class="el-table_3_column_1"><div class="cell">B0CF1W16JG 999 g<br>9 x 9 x 9 cm</div></td>
+        <td class="el-table_3_column_2"><div class="cell">760 g<br>37.1 x 33.4 x 1.3 cm</div></td>
+        <td class="el-table_3_column_3"><div class="cell">204 g<br>11.2 x 9.7 x 6.1 cm</div></td>
+      </tr>
+    </tbody></table>
+  </div>
+</div>
+"""
+
+PARTIAL_PACKAGE_HTML = """
+<div class="el-table">
+  <div class="el-table__header-wrapper">
+    <table class="el-table__header"><thead><tr>
+      <th class="el-table_5_column_2"><div class="cell">包装重量<br>包装尺寸</div></th>
+      <th class="el-table_5_column_3"><div class="cell">商品重量<br>商品尺寸</div></th>
+    </tr></thead></table>
+  </div>
+  <div class="el-table__body-wrapper">
+    <table class="el-table__body"><tbody>
+      <tr class="el-table__row">
+        <td class="el-table_5_column_2"><div class="cell">204 g</div></td>
+        <td class="el-table_5_column_3"><div class="cell">760 g<br>37.1 x 33.4 x 1.3 cm</div></td>
+      </tr>
+    </tbody></table>
+  </div>
+</div>
+"""
+
+EMPTY_COLUMNS_HTML = """
+<div class="el-table">
+  <div class="el-table__header-wrapper">
+    <table class="el-table__header"><thead><tr>
+      <th class="el-table_4_column_1"><div class="cell">商品</div></th>
+      <th class="el-table_4_column_2"><div class="cell">包装重量<br>包装尺寸</div></th>
+      <th class="el-table_4_column_3"><div class="cell">商品重量<br>商品尺寸</div></th>
+    </tr></thead></table>
+  </div>
+  <div class="el-table__body-wrapper">
+    <table class="el-table__body"><tbody>
+      <tr class="el-table__row">
+        <td class="el-table_4_column_1"><div class="cell">B0CF1W16JG 999 g<br>9 x 9 x 9 cm</div></td>
+        <td class="el-table_4_column_2"><div class="cell">-</div></td>
+        <td class="el-table_4_column_3"><div class="cell">-</div></td>
+      </tr>
+    </tbody></table>
+  </div>
+</div>
+"""
+
+SHIFTED_HEADER_HTML = """
+<div class="el-table">
+  <div class="el-table__header-wrapper">
+    <table class="el-table__header"><thead><tr>
+      <th class="gutter"></th>
+      <th class="el-table_2_column_8"><div class="cell">商品重量<br>商品尺寸</div></th>
+    </tr></thead></table>
+  </div>
+  <div class="el-table__body-wrapper">
+    <table class="el-table__body"><tbody>
+      <tr class="el-table__row">
+        <td class="el-table_2_column_8"><div class="cell">760 g<br>37.1 x 33.4 x 1.3 cm</div></td>
+      </tr>
+    </tbody></table>
+  </div>
+</div>
+"""
+
 
 class SellerSpriteTests(unittest.TestCase):
     def test_lookup_url_uses_the_opened_asin(self) -> None:
@@ -83,6 +183,13 @@ class SellerSpriteTests(unittest.TestCase):
         self.assertEqual(cell["length"], "23.6")
         self.assertEqual(parse_package_cell("1,200 g"), {"weight": "1200", "weight_unit": "g"})
         self.assertEqual(parse_package_cell("1.25kg"), {"weight": "1.25", "weight_unit": "kg"})
+        shown = parse_package_cell("商品重量\n商品尺寸\n760 g\n37.1 × 33.4 × 1.3 cm")
+        self.assertEqual(shown["weight"], "760")
+        self.assertEqual(shown["weight_unit"], "g")
+        self.assertEqual(shown["length"], "37.1")
+        self.assertEqual(shown["width"], "33.4")
+        self.assertEqual(shown["height"], "1.3")
+        self.assertEqual(shown["unit"], "cm")
         self.assertIsNone(parse_package_cell("-\n-"))
 
     def test_login_reads_env_local(self) -> None:
@@ -112,6 +219,39 @@ class SellerSpriteTests(unittest.TestCase):
                 self.assertEqual(found["status"], "table")
                 self.assertIn("23.6 x 16.3 x 7.1 cm", found["text"])
                 self.assertNotIn("10 x 1 x 1", found["text"])
+
+                page.set_content(RENAMED_COLUMN_HTML)
+                renamed = page.wait_for_function(LOOKUP_STATE_JS, arg="B0CF1W16JG", timeout=3000).json_value()
+                self.assertEqual(renamed["status"], "table")
+                self.assertIn("760 g", renamed["text"])
+                self.assertIn("37.1 × 33.4 × 1.3 cm", renamed["text"])
+                self.assertNotIn("黑胶", renamed["text"])
+
+                page.set_content(PACKAGE_WINS_HTML)
+                package_first = page.wait_for_function(LOOKUP_STATE_JS, arg="B0CF1W16JG", timeout=3000).json_value()
+                self.assertEqual(package_first["status"], "table")
+                self.assertIn("204 g", package_first["text"])
+                self.assertIn("11.2 x 9.7 x 6.1 cm", package_first["text"])
+                self.assertNotIn("760 g", package_first["text"])
+                self.assertNotIn("999 g", package_first["text"])
+
+                page.set_content(PARTIAL_PACKAGE_HTML)
+                partial = page.wait_for_function(LOOKUP_STATE_JS, arg="B0CF1W16JG", timeout=3000).json_value()
+                self.assertEqual(partial["status"], "table")
+                self.assertIn("204 g", partial["text"])
+                self.assertNotIn("760 g", partial["text"])
+                self.assertNotIn("37.1", partial["text"])
+
+                page.set_content(EMPTY_COLUMNS_HTML)
+                blank = page.wait_for_function(LOOKUP_STATE_JS, arg="B0CF1W16JG", timeout=3000).json_value()
+                self.assertEqual(blank["status"], "table")
+                self.assertEqual(blank["text"], "")
+
+                page.set_content(SHIFTED_HEADER_HTML)
+                shifted = page.wait_for_function(LOOKUP_STATE_JS, arg="B0CF1W16JG", timeout=3000).json_value()
+                self.assertEqual(shifted["status"], "table")
+                self.assertIn("760 g", shifted["text"])
+                self.assertIn("37.1 x 33.4 x 1.3 cm", shifted["text"])
 
                 page.set_content("<body><p>您是游客身份，建议立即登录</p></body>")
                 guest = page.wait_for_function(LOOKUP_STATE_JS, arg="B0H4PD2Z7G", timeout=3000).json_value()

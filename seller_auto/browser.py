@@ -38,11 +38,24 @@ def log(message: str) -> None:
 
 
 class ArgentinaBrowser:
-    def __init__(self, settings: DelaySettings, profile_dir: Path, headless: bool = True) -> None:
+    def __init__(
+        self,
+        settings: DelaySettings,
+        profile_dir: Path,
+        headless: bool = True,
+        locale: str = "es-AR",
+        accept_language: str = "es-AR,es;q=0.9",
+        timezone_id: str = "America/Argentina/Buenos_Aires",
+        geolocation: dict[str, float] | None = None,
+    ) -> None:
         self.settings = settings
         self.profile_dir = profile_dir
         self.background = headless
         self.headless = headless
+        self.locale = locale
+        self.accept_language = accept_language
+        self.timezone_id = timezone_id
+        self.geolocation = geolocation
         self.amazon_cooldown = Cooldown(settings.amazon_min_delay, settings.amazon_max_delay, label="亚马逊")
         self.ml_cooldown = Cooldown(settings.ml_min_delay, settings.ml_max_delay, label="美客多")
         self._playwright: Any = None
@@ -65,6 +78,10 @@ class ArgentinaBrowser:
             self.profile_dir,
             headless=self.headless,
             chrome_version=read_chromium_version(browsers),
+            locale=self.locale,
+            accept_language=self.accept_language,
+            timezone_id=self.timezone_id,
+            geolocation=self.geolocation,
         )
         Path(options["user_data_dir"]).mkdir(parents=True, exist_ok=True)
         playwright = sync_playwright().start()
