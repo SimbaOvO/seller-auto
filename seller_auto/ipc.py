@@ -11,12 +11,13 @@ import sys
 import time
 from pathlib import Path
 
+from seller_auto.browser_launch import use_playwright_browsers
 from seller_auto.service import ToolPayload
 
 ROOT = Path(__file__).resolve().parent.parent
 SOCKET_PATH = ROOT / "data" / "seller-auto.sock"
 PID_PATH = ROOT / "data" / "seller-auto.pid"
-CODE_REVISION = "mcp-submit-followup"
+CODE_REVISION = "mcp-playwright-browsers"
 
 
 def encode_message(payload: dict) -> bytes:
@@ -135,6 +136,7 @@ def ensure_daemon() -> None:
     env = os.environ.copy()
     env["SELLER_AUTO_DAEMON"] = "1"
     env["SELLER_AUTO_LOG"] = str(log_file)
+    env["PLAYWRIGHT_BROWSERS_PATH"] = str(use_playwright_browsers())
     with log_file.open("a", encoding="utf-8") as handle:
         subprocess.Popen(
             [sys.executable, "-m", "seller_auto.daemon"],

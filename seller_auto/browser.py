@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import random
 import time
 from pathlib import Path
@@ -14,6 +13,7 @@ from seller_auto.browser_launch import (
     persistent_context_options,
     profile_is_busy,
     read_chromium_version,
+    use_playwright_browsers,
 )
 from seller_auto.pacing import Cooldown, DelaySettings
 from seller_auto.urls import looks_like_verification_url, text_looks_blocked
@@ -73,7 +73,7 @@ class ArgentinaBrowser:
         self._wait_until_profile_free()
         if mark_clean_shutdown(self.profile_dir):
             log("已清掉上次异常退出标记")
-        browsers = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", Path.home() / "Library/Caches/ms-playwright"))
+        browsers = use_playwright_browsers()
         options = persistent_context_options(
             self.profile_dir,
             headless=self.headless,

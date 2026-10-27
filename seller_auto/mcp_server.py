@@ -12,6 +12,7 @@ from typing import Annotated, Any
 from mcp.server.mcpserver import Image, MCPServer
 from pydantic import BaseModel, Field
 
+from seller_auto.browser_launch import use_playwright_browsers
 from seller_auto.service import SellerAutoService, ToolPayload
 
 INSTRUCTIONS = """
@@ -138,6 +139,7 @@ def _blocks(payload: ToolPayload) -> list[Any]:
 
 
 def main() -> None:
+    use_playwright_browsers()
     build_server().run(transport="stdio")
 
 

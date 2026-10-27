@@ -31,6 +31,45 @@ LAUNCH_ARGS = [
     "--lang=es-AR",
 ]
 
+CHROME_FOR_TESTING = (
+    "chromium-*/chrome-mac-*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+)
+
+
+def default_playwright_browsers_dir() -> Path:
+    """Playwright 未设置 PLAYWRIGHT_BROWSERS_PATH 时使用的目录。"""
+
+    return Path.home() / "Library/Caches/ms-playwright"
+
+
+def is_sandbox_browsers_path(path: str | Path) -> bool:
+    return "cursor-sandbox-cache" in str(path)
+
+
+def chrome_for_testing_binary(browsers_dir: Path) -> Path | None:
+    matches = sorted(browsers_dir.glob(CHROME_FOR_TESTING))
+    return matches[-1] if matches else None
+
+
+def playwright_browsers_dir() -> Path:
+    """先用 Playwright 自己的浏览器目录，不用 Cursor 沙箱缓存。"""
+
+    default = default_playwright_browsers_dir()
+    if chrome_for_testing_binary(default):
+        return default
+    env = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if env and env != "0" and not is_sandbox_browsers_path(env):
+        return Path(env)
+    return default
+
+
+def use_playwright_browsers() -> Path:
+    """覆盖沙箱里的 PLAYWRIGHT_BROWSERS_PATH，让 Playwright 去自己的目录找浏览器。"""
+
+    browsers = playwright_browsers_dir()
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
+    return browsers
+
 
 def desktop_chrome_user_agent(version: str) -> str:
     """本机是 macOS，请求头用普通桌面 Chrome，去掉 HeadlessChrome。"""

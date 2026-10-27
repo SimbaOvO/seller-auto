@@ -8,6 +8,7 @@ import socket
 import threading
 import traceback
 
+from seller_auto.browser_launch import use_playwright_browsers
 from seller_auto.ipc import CODE_REVISION, PID_PATH, SOCKET_PATH, encode_message, payload_to_message, read_message
 from seller_auto.pacing import DelaySettings
 from seller_auto.service import SellerAutoService
@@ -16,6 +17,7 @@ from seller_auto.step_log import step
 
 def main() -> None:
     os.environ["SELLER_AUTO_DAEMON"] = "1"
+    use_playwright_browsers()
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
     if SOCKET_PATH.exists():

@@ -1,16 +1,22 @@
 import json
+import os
 import plistlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from seller_auto.browser_launch import (
     STEALTH_JS,
+    default_playwright_browsers_dir,
     desktop_chrome_user_agent,
+    is_sandbox_browsers_path,
     mark_clean_shutdown,
     persistent_context_options,
+    playwright_browsers_dir,
     profile_is_busy,
     read_chromium_version,
+    use_playwright_browsers,
 )
 from seller_auto.pacing import DelaySettings
 
@@ -67,6 +73,26 @@ class BrowserLaunchTests(unittest.TestCase):
             saved = json.loads(prefs.read_text(encoding="utf-8"))
             self.assertEqual(saved["profile"]["exit_type"], "Normal")
             self.assertFalse(mark_clean_shutdown(Path(directory)))
+
+
+class PlaywrightBrowsersPathTests(unittest.TestCase):
+    def test_sandbox_cache_is_ignored(self) -> None:
+        sandbox = (
+            "/var/folders/_3/tmp/cursor-sandbox-cache/"
+            "5f9dd362485f432c858dcbff1bc0fd02/playwright"
+        )
+        self.assertTrue(is_sandbox_browsers_path(sandbox))
+        with mock.patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": sandbox}):
+            path = playwright_browsers_dir()
+        self.assertEqual(path, default_playwright_browsers_dir())
+        self.assertNotIn("cursor-sandbox-cache", str(path))
+
+    def test_use_playwright_browsers_overrides_sandbox_env(self) -> None:
+        sandbox = "/tmp/cursor-sandbox-cache/playwright"
+        with mock.patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": sandbox}):
+            path = use_playwright_browsers()
+            self.assertEqual(Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]), path)
+            self.assertNotIn("cursor-sandbox-cache", os.environ["PLAYWRIGHT_BROWSERS_PATH"])
 
 
 class BackgroundDefaultTests(unittest.TestCase):
