@@ -13,7 +13,7 @@ alwaysApply: true
 
 用户说「处理这个店铺id：A，只处理这个商品：B」时，第一次工具调用只能是 open_product(seller_id=A, product=B)。不要搜索项目代码，不要先调用 open_store，不要查会话。打开商品后立刻 set_keywords 去美客多；set_keywords 会直接带回第一批列表图，已经有图就提交判断，不要再调用 next_listing_batch。卖家精灵和货源查询由后台并行完成，不要等它们。
 
-提交 `submit_listing_matches` 和 `submit_ad_matches` 时，`model_name` 填 `cursor-grok-4.5-low-fast`。提交的返回里已经是下一步要看的列表图、广告图、下一张亚马逊主图，或结束。直接判断。不要为了等详情调用 session_status，也不要再调用 next_listing_batch、next_ad_batch、export_results 或 next_amazon_product。详情和写表在后台进行。只有返回明确要求手动验证时才调用 session_status。不要重复提交同一批。如果图丢了，再调用一次 next_listing_batch 或 next_ad_batch，会把还没判断的同一批发回来。
+提交 `submit_listing_matches` 和 `submit_ad_matches` 时，`model_name` 填 `cursor-grok-4.5-low-fast`。提交的返回里已经是下一步要看的列表图、广告图、下一张亚马逊主图，或结束时，直接判断。若返回说同款详情还在打开，只调用 session_status，直到返回里重新带上图、主图或结束。不要重复提交同一批，也不要在详情还在打开时调用 next_listing_batch 或 next_ad_batch。只有返回明确要求手动验证时才调用 session_status。如果图丢了，再调用一次 next_listing_batch 或 next_ad_batch，会把还没判断的同一批发回来。详情和写表在后台进行。不要调用 export_results 或 next_amazon_product。
 
 判成同款后：广告卡片已经写了 vendidos 的不再打开详情。列表同款仍打开详情抓全量广告；广告商品详情不再读取里面的广告。自己维护销量前 10：卡片或详情销量挤不进前 10 的直接跳过。详情没有 vendido 的不记录。写表取这 10 条。
 

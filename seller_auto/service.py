@@ -6,6 +6,7 @@ import copy
 import queue
 import threading
 import traceback
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -177,16 +178,19 @@ class SellerAutoService:
         return self._guard(self._set_keywords, product_id, keywords, chinese_name)
 
     def next_listing_batch(self) -> ToolPayload:
+        ready = self._fast_listing_replay()
+        if ready is not None:
+            return ready
         return self._guard(self._next_listing_batch)
 
     def submit_listing_matches(self, matches: list[Any], model_name: str = "") -> ToolPayload:
-        return self._guard(self._accept_matches, matches, model_name, "search")
+        return self._accept_matches(matches, model_name, "search")
 
     def next_ad_batch(self, product_id: str) -> ToolPayload:
         return self._guard(self._next_ad_batch, product_id)
 
     def submit_ad_matches(self, matches: list[Any], model_name: str = "") -> ToolPayload:
-        return self._guard(self._accept_matches, matches, model_name, "recommendation")
+        return self._accept_matches(matches, model_name, "recommendation")
 
     def session_status(self) -> ToolPayload:
         return self._read_status()
@@ -382,6 +386,24 @@ class SellerAutoService:
                 snapshot = copy.deepcopy(self._published if self._published is not None else self.state)
             if snapshot is None:
                 raise UrlError("还没有会话。请先调用 open_store 或 resume_session")
+            product = (snapshot.get("products") or {}).get(snapshot.get("current_product_id") or "") or {}
+            if product.get("sales_pending") or snapshot.get("export_pending") or snapshot.get("challenge_pending"):
+                return self._payload(
+                    {"ok": True, "status": "status", "message": self._status_message(snapshot)},
+                    state=snapshot,
+                )
+            step_name = next_required_step(snapshot)
+            if step_name in {"next_listing_batch", "submit_listing_matches", "next_ad_batch", "submit_ad_matches", "export_results"}:
+                recorded = self._payload(
+                    {
+                        "ok": True,
+                        "status": "matches_recorded",
+                        "product_id": snapshot.get("current_product_id") or "",
+                        "message": "进度已更新。",
+                    },
+                    state=snapshot,
+                )
+                return self._worker.call(self._attach_followup, recorded)
             return self._payload(
                 {"ok": True, "status": "status", "message": self._status_message(snapshot)},
                 state=snapshot,
@@ -1140,17 +1162,21 @@ class SellerAutoService:
                 if needs_open
                 else "判断已记录。下面是下一批列表图。"
             )
+            if needs_open:
+                self._queue_sales(prefetch_listing=not self._current_product()["listing"].get("page2_done"))
             ready = self._ready_listing_batch(note)
             if ready is not None:
-                if needs_open:
-                    self._queue_sales(prefetch_listing=not self._current_product()["listing"].get("page2_done"))
                 return ready
-            if needs_open:
-                self._mark_sales_started()
-                self._drain_sales()
-                waiting = self._sales_wait_payload(product_id, source)
-                if waiting is not None:
-                    return waiting
+            if needs_open or self._current_product().get("sales_pending"):
+                return self._payload(
+                    {
+                        "ok": True,
+                        "status": "sales_started",
+                        "product_id": product_id,
+                        "source": source,
+                        "message": "判断已记录，同款详情还在打开。请只调用 session_status，下一批图或下一张主图好了会直接带上。不要重复提交。",
+                    }
+                )
             recorded = self._payload(
                 {
                     "ok": True,
@@ -1160,7 +1186,7 @@ class SellerAutoService:
                     "message": "判断已记录。",
                 }
             )
-            return self._attach_followup(recorded)
+            return self._worker.call(self._attach_followup, recorded)
         except (UrlError, MatchInputError) as exc:
             return ToolPayload({"ok": False, "status": "error", "message": str(exc)})
 
@@ -1189,7 +1215,16 @@ class SellerAutoService:
             self._commit_locked()
 
     def _queue_sales(self, prefetch_listing: bool) -> None:
-        self._mark_sales_started()
+        with self._state_lock:
+            product = self._current_product()
+            if product.get("sales_running"):
+                product["sales_pending"] = True
+                self._commit_locked()
+                return
+            product["sales_pending"] = True
+            product["sales_error"] = ""
+            product["sales_running"] = True
+            self._commit_locked()
 
         def run() -> None:
             self._drain_sales()
@@ -1988,16 +2023,51 @@ class SellerAutoService:
         return candidates
 
     def _ensure_candidate_files(self, candidates: list[dict[str, Any]], page_url: str) -> None:
-        browser = self._ensure_browser()
         for candidate in candidates:
             if candidate.get("image_path"):
                 continue
-            candidate["image_path"] = self._download(
-                candidate.get("image_url") or "",
-                self._image_stem(candidate["candidate_id"]),
-                None,
-                page_url or browser.list_page.url,
-            )
+            url = str(candidate.get("image_url") or "")
+            stem = self._image_stem(candidate["candidate_id"])
+            if url:
+                try:
+                    candidate["image_path"] = str(save_original(_http_image(url, page_url), stem))
+                    continue
+                except Exception as exc:
+                    log(f"直接下载图片失败：{exc}")
+            if self._browser_busy():
+                continue
+            candidate["image_path"] = self._download(url, stem, None, page_url)
+
+    def _browser_busy(self) -> bool:
+        state = self.state or {}
+        product = (state.get("products") or {}).get(state.get("current_product_id") or "") or {}
+        listing = product.get("listing") or {}
+        return bool(product.get("sales_running") or product.get("sales_pending") or listing.get("page2_prefetching") or product.get("ad_prefetching"))
+
+    def _fast_listing_replay(self) -> ToolPayload | None:
+        """已经发给模型、但还没提交的列表图。不占用正在开详情的浏览器。"""
+
+        if self.state is None:
+            return None
+        try:
+            product = self._current_product()
+        except UrlError:
+            return None
+        listing = product.get("listing") or {}
+        if not product.get("ml_search_url"):
+            return None
+        pending = list(
+            _unjudged_delivered(listing.get("candidates") or [], listing.get("next_index"), product.get("judged_ids"))
+        )
+        if not pending:
+            return None
+        self._ensure_candidate_files(pending, page_url=product["ml_search_url"])
+        self._save()
+        payload = self._candidate_payload(product, pending, "listing_batch")
+        payload.data["message"] = "下面是还没判断的同一批列表图。" + self._compare_message(
+            "listing", payload.data.get("title_dropped") or []
+        )
+        return payload
 
     def _download(self, url: str, stem: Path, locator: Any, referer: str) -> str:
         browser = self._ensure_browser()
@@ -2069,6 +2139,22 @@ class SellerAutoService:
             "parent_url": match.get("parent_url"),
             "model_name": match.get("model_name") or "",
         }
+
+
+def _http_image(url: str, referer: str) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Referer": referer or url,
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        body = response.read()
+    if not body:
+        raise RuntimeError(f"图片下载失败：空响应 {url}")
+    return body
 
 
 class _Blocked(Exception):

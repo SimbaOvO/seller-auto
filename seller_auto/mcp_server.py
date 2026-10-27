@@ -29,7 +29,7 @@ INSTRUCTIONS = """
 
 每个 ASIN 的顺序：set_keywords 会直接返回第一批列表图 → submit_listing_matches → 广告图由提交的返回带上。整店里服务会自己写表，再在同一次返回里打开下一条。
 打开商品后立刻 set_keywords 去美客多比对。卖家精灵查包装，并在该行下方点击「1688找货源」读取货源均价，由后台另一条浏览器并行完成，不要等它们结束。看列表图或广告图时，服务会在同一条美客多浏览器上提前抓下一页，风控间隔不变。列表和广告都结束后服务自己写表，不要调用 export_results。写表前会等卖家精灵和货源结束，再用整理好的美客多链接去蓝鲸选品查询。查到的 30 天销量汇总进名称，格式是「中文名（xx单）」，不要另加「商品」。FBA 运费用卖家精灵的重量和长宽高，按美客多运费表和同款最低售价计算后写入。没有同款的商品不写入表格。不要自己打开蓝鲸。
-提交的返回里已经是下一步要看的列表图、广告图、下一张亚马逊主图，或结束。直接判断，不要为了等详情调用 session_status，也不要再调用 next_listing_batch、next_ad_batch、export_results 或 next_amazon_product。详情和写表在后台进行。只有返回明确要求手动验证时才调用 session_status。不要重复提交同一批。如果图丢了，再调用一次 next_listing_batch 或 next_ad_batch，会把还没判断的同一批发回来。
+提交的返回里已经是下一步要看的列表图、广告图、下一张亚马逊主图，或结束时，直接判断。若返回说同款详情还在打开，只调用 session_status，直到返回里重新带上图、主图或结束。不要重复提交同一批，也不要在详情还在打开时调用 next_listing_batch 或 next_ad_batch。只有返回明确要求手动验证时才在前台完成后再调用 session_status。如果图丢了，再调用一次 next_listing_batch 或 next_ad_batch，会把还没判断的同一批发回来。不要调用 export_results 或 next_amazon_product。
 整店下一次返回已经是下一张主图时，直接 set_keywords，直到返回 end_of_store。单品返回结束后不要再翻店铺。
 
 关键词去掉品牌、尺寸、重量、数量、颜色和空泛用途，保留 “para + 物品”。调用 set_keywords 时同时给出 chinese_name：根据商品标题译成简短中文名，例如「折叠购物车」。表格里的名称用这个中文名，SKU 用关键词。

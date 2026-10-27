@@ -87,17 +87,20 @@ class DispatchTests(unittest.TestCase):
                 [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
                 "cursor-grok-4.5-low-fast",
             )
-            self.assertTrue(drained.is_set())
-            self.assertTrue(exported.is_set())
-            self.assertEqual(payload.data["status"], "finished")
-            self.assertEqual(payload.data["next_step"], "done")
-            self.assertIn("不要再调用 export_results", payload.data["message"])
+            self.assertEqual(payload.data["status"], "sales_started")
+            self.assertIn("session_status", payload.data["message"])
             duplicate = service.submit_listing_matches(
                 [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
                 "cursor-grok-4.5-low-fast",
             )
             self.assertEqual(duplicate.data["status"], "already_submitted")
-            self.assertIn("不要重复提交", duplicate.data["message"])
+            service._worker.call(lambda: None)
+            self.assertTrue(drained.is_set())
+            finished = service.session_status()
+            self.assertTrue(exported.is_set())
+            self.assertEqual(finished.data["status"], "finished")
+            self.assertEqual(finished.data["next_step"], "done")
+            self.assertIn("不要再调用 export_results", finished.data["message"])
 
     def test_submit_returns_buffered_listing_while_details_open(self) -> None:
         started = threading.Event()
@@ -165,10 +168,13 @@ class DispatchTests(unittest.TestCase):
                 [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
                 "cursor-grok-4.5-low-fast",
             )
-            self.assertEqual(payload.data["status"], "amazon_product")
-            self.assertEqual(payload.data["product_id"], "B0NEXT")
-            self.assertIn("不要调用 export_results", payload.data["message"])
-            self.assertIn("set_keywords", payload.data["message"])
+            self.assertEqual(payload.data["status"], "sales_started")
+            service._worker.call(lambda: None)
+            opened = service.session_status()
+            self.assertEqual(opened.data["status"], "amazon_product")
+            self.assertEqual(opened.data["product_id"], "B0NEXT")
+            self.assertIn("不要调用 export_results", opened.data["message"])
+            self.assertIn("set_keywords", opened.data["message"])
 
     def test_lost_listing_batch_is_sent_again(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
