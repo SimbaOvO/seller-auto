@@ -24,7 +24,16 @@ py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m playwright install chromium
 ```
 
-macOS 上已经登录过的 `data/profile` 不要拷到 Windows。卖家精灵、美客多和蓝鲸需要在 Windows 上重新登录。
+换到一台新电脑时，把项目拷过去或重新克隆，不要拷 `.venv`。虚拟环境和 Chrome for Testing 都在新电脑上按上面的命令重装。`output/` 和 `logs/` 只是以前的结果和日志，不拷也能开始。新电脑需要能打开亚马逊墨西哥、美客多阿根廷、卖家精灵、1688 和蓝鲸选品。用 Cursor 打开项目后，按下一节启用自带的 MCP。
+
+卖家精灵账号写在项目根目录的 `.env.local`，这个文件不会进 git：
+
+```text
+E2E_USERNAME=卖家精灵账号
+E2E_PASSWORD=卖家精灵密码
+```
+
+没有这个文件就查不了包装和 1688 货源。macOS 上已经登录过的 `data/profile` 不要拷到 Windows。两台都是 Mac 时可以拷 `data/profile` 带上登录态，第一次仍要在前台确认。卖家精灵靠 `.env.local` 自己登录。蓝鲸选品和 1688 第一次打开时如果还没登录，会短暂弹出前台窗口，登录完成后回到后台。美客多出现验证页时同样在前台完成。
 
 ## 在 Cursor 里使用
 
