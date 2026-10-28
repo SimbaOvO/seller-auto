@@ -18,11 +18,34 @@ python3.13 -m venv .venv
 
 Windows：
 
+没有 `py` 启动器时，先装 Python 3.13，装完新开一个终端：
+
+```bat
+winget install --id Python.Python.3.13 -e --scope user --accept-package-agreements --accept-source-agreements
+```
+
+官方 PyPI 和 Playwright 的下载源在国内往往很慢。依赖走清华源，Chrome for Testing 走 npmmirror：
+
 ```bat
 py -3.13 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+set PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
 .venv\Scripts\python.exe -m playwright install chromium
 ```
+
+新终端里仍然没有 `py` 时，把创建虚拟环境的那一行换成：
+
+```bat
+"%LOCALAPPDATA%\Programs\Python\Python313\python.exe" -m venv .venv
+```
+
+官方安装包只有 `python.exe`，没有 `python3`。不要改 [`.cursor/mcp.json`](.cursor/mcp.json)。在 Python 安装目录做硬链接，让 `python3` 指向同一个解释器：
+
+```bat
+mklink /H "%LOCALAPPDATA%\Programs\Python\Python313\python3.exe" "%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
+```
+
+用户 PATH 里 `Python313` 要排在 `WindowsApps` 前面，避免命中微软商店的 `python3` 占位程序。Cursor 在安装 Python 之前就已经打开时，它的 PATH 里没有 `Python313`，`python3` 会落到商店占位程序并马上退出。只重连 MCP 不够，需要完全退出 Cursor 再打开。硬链接必须和 `python.exe` 放在同一目录，否则解释器找不到旁边的 DLL。
 
 换到一台新电脑时，把项目拷过去或重新克隆，不要拷 `.venv`。虚拟环境和 Chrome for Testing 都在新电脑上按上面的命令重装。`output/` 和 `logs/` 只是以前的结果和日志，不拷也能开始。新电脑需要能打开亚马逊墨西哥、美客多阿根廷、卖家精灵、1688 和蓝鲸选品。用 Cursor 打开项目后，按下一节启用自带的 MCP。
 
@@ -37,7 +60,7 @@ E2E_PASSWORD=卖家精灵密码
 
 ## 在 Cursor 里使用
 
-项目自带 [`.cursor/mcp.json`](.cursor/mcp.json)，服务名是 `seller-auto`。它用 `python3` 运行 `scripts/launch_mcp.py`，再转到虚拟环境里的解释器。Windows 上如果没有 `python3` 这个命令，把 `command` 改成 `python`。看图、写关键词和判断同款由对话里当前选中的模型完成。提交时 `model_name` 填当前模型名。在对话里说：
+项目自带 [`.cursor/mcp.json`](.cursor/mcp.json)，服务名是 `seller-auto`。它用 `python3` 运行 `scripts/launch_mcp.py`，再转到虚拟环境里的解释器。Windows 上按上一节做成 `python3` 硬链接，不要改 `command`，并先重启 Cursor。看图、写关键词和判断同款由对话里当前选中的模型完成。提交时 `model_name` 填当前模型名。在对话里说：
 
 ```text
 处理这个店铺id：A1A10HFD4KEZW5
