@@ -20,8 +20,8 @@ _NUMBER = re.compile(r"(\d+(?:\.\d+)?)")
 # 阿根廷官方海外仓：体积重量（kg）= 长 × 宽 × 高（cm）/ 4000。
 MLA_VOLUME_DIVISOR = 4000
 # 每档是（重量下限不含，上限含，六个售价档）。最后一档上限为空，表示大于下限。
-# 售价档顺序：二手或免费、小于 15999、16000–23999、24000–32999、33000–50000、大于等于 50000。
-# 和页面一致：有上下限时售价 >= 下限且 < 上限；绿色声誉。
+# 售价档顺序：二手或免费、小于等于 15999、16000–23999、24000–32999、33000–50000、大于等于 50000。
+# 有上下限时含两端。50000 同时落在最后两档，取大于等于 50000 那一档。绿色声誉。
 _RATE_TABLE = (
     (0, 0.3, (13580, 1330, 2740, 3320, 7428, 8148)),
     (0.3, 0.5, (14580, 1370, 2760, 3340, 8148, 8748)),
@@ -234,11 +234,11 @@ def last_mile_fee(weight_kg: float, price: float) -> int | None:
             continue
         matched = False
         if low is not None and high is not None:
-            matched = amount >= low and amount < high
+            matched = amount >= low and amount <= high
         elif low is not None:
             matched = amount >= low
         elif high is not None:
-            matched = amount < high
+            matched = amount <= high
         if matched:
             found = rates[index]
     return found

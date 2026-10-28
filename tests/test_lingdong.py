@@ -81,6 +81,10 @@ class LingdongParseTests(unittest.TestCase):
         self.assertEqual(last_mile_fee(0.31, 22425), 2760)
         self.assertEqual(last_mile_fee(180, 60000), 135588)
         self.assertEqual(last_mile_fee(180.1, 60000), 147948)
+        self.assertEqual(last_mile_fee(0.22, 15999), 1330)
+        self.assertEqual(last_mile_fee(0.22, 23999), 2740)
+        self.assertEqual(last_mile_fee(0.22, 32999), 3320)
+        self.assertEqual(last_mile_fee(0.22, 50000), 8148)
         heavy = chargeable_kilograms(
             {"item_weight": "200", "item_length": "100 cm", "item_width": "100 cm", "item_height": "100 cm"},
             None,
@@ -396,6 +400,46 @@ class LingdongExportTests(unittest.TestCase):
             sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
             self.assertIsNone(sheet.cell(4, 1).value)
             self.assertEqual(len(seen), 2)
+
+    def test_replaced_session_keeps_its_flags_and_the_old_row_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook_path = root / "book.xlsx"
+            _workbook(workbook_path)
+            service = SellerAutoService(DelaySettings(), output_dir=str(root), workbook_path=str(workbook_path))
+            state = _new_state("sess", "SELLER1", "https://www.amazon.com.mx/s?me=SELLER1")
+            state["single_product"] = "B0TEST1234"
+            state["product_order"] = ["B0TEST1234"]
+            state["current_product_id"] = "B0TEST1234"
+            state["products"]["B0TEST1234"] = _asin(
+                "硅胶灶台缝隙盖",
+                "cubiertas",
+                "https://www.mercadolibre.com.ar/p/MLA1",
+            )
+            service.state = state
+            service._save()
+
+            def fake(jobs: list[dict]) -> str:
+                replacement = _new_state("other", "SELLER2", "https://www.amazon.com.mx/s?me=SELLER2")
+                replacement["export_pending"] = True
+                service.state = replacement
+                self.assertEqual(jobs[0]["product_id"], "B0TEST1234")
+                return ""
+
+            service._run_market_quotes = fake
+            service.export_results()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
+                if sheet.cell(2, 1).value:
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("原商品没有写入表格")
+            self.assertEqual(sheet.cell(2, 1).value, "硅胶灶台缝隙盖")
+            self.assertEqual(service.state["session_id"], "other")
+            self.assertTrue(service.state["export_pending"])
+            self.assertFalse(service.state.get("export_result"))
 
 
 def _asin(name: str, keywords: str, url: str) -> dict:

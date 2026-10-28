@@ -5,10 +5,12 @@ from pathlib import Path
 from unittest import mock
 
 from seller_auto.ipc import (
+    CODE_REVISION,
     _CREATE_NEW_PROCESS_GROUP,
     _CREATE_NO_WINDOW,
     _pid_alive,
     _stop_daemon,
+    code_revision,
     encode_message,
     ensure_daemon,
     read_message,
@@ -93,6 +95,34 @@ class IpcTests(unittest.TestCase):
         flags = kwargs["creationflags"]
         self.assertEqual(flags & _CREATE_NEW_PROCESS_GROUP, _CREATE_NEW_PROCESS_GROUP)
         self.assertEqual(flags & _CREATE_NO_WINDOW, _CREATE_NO_WINDOW)
+
+    def test_revision_follows_the_source_files(self) -> None:
+        self.assertEqual(code_revision(), CODE_REVISION)
+        self.assertEqual(len(CODE_REVISION), 16)
+        int(CODE_REVISION, 16)
+
+    def test_same_revision_keeps_the_running_daemon(self) -> None:
+        with (
+            mock.patch("seller_auto.ipc._ping", return_value=True),
+            mock.patch("seller_auto.ipc._revision", return_value=CODE_REVISION),
+            mock.patch("seller_auto.ipc._stop_daemon") as stop,
+            mock.patch("seller_auto.ipc.subprocess.Popen") as popen,
+        ):
+            ensure_daemon()
+        stop.assert_not_called()
+        popen.assert_not_called()
+
+    def test_source_change_restarts_the_daemon(self) -> None:
+        with (
+            mock.patch("seller_auto.ipc._ping", side_effect=[True, True]),
+            mock.patch("seller_auto.ipc._revision", return_value="stale"),
+            mock.patch("seller_auto.ipc._stop_daemon") as stop,
+            mock.patch("seller_auto.ipc._clear_stale"),
+            mock.patch("seller_auto.ipc.use_playwright_browsers", return_value=Path("browsers")),
+            mock.patch("seller_auto.ipc.subprocess.Popen"),
+        ):
+            ensure_daemon()
+        stop.assert_called_once()
 
 
 if __name__ == "__main__":

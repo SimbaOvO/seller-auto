@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 
 from seller_auto.pacing import DelaySettings
 from seller_auto.service import SellerAutoService, _new_state, _replay_ad_batch
@@ -184,6 +185,20 @@ class DispatchTests(unittest.TestCase):
             payload = service._next_listing_batch()
             self.assertEqual(payload.data["candidates"][0]["candidate_id"], "c1")
             self.assertEqual(service.state["products"]["B07LCLQ47D"]["listing"]["next_index"], 1)
+
+    def test_browser_image_download_stays_on_the_browser_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            seen: dict[str, str] = {}
+
+            def download(url: str, stem: Path, locator: object, referer: str) -> str:
+                seen["thread"] = threading.current_thread().name
+                return "saved.jpg"
+
+            service._download = download
+            saved = service._fetch_candidate_image("", Path(directory) / "x", "")
+            self.assertEqual(saved, "saved.jpg")
+            self.assertEqual(seen["thread"], "seller-auto-browser")
 
     def test_lost_ad_batch_is_sent_again(self) -> None:
         product = _state()["products"]["B07LCLQ47D"]

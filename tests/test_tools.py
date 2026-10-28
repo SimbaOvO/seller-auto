@@ -55,15 +55,18 @@ class ToolContractTests(unittest.TestCase):
         self.assertIn("高度相似", INSTRUCTIONS)
         self.assertIn("并行", INSTRUCTIONS)
         self.assertIn("标题", INSTRUCTIONS)
-        self.assertIn("不要进图片对比", INSTRUCTIONS)
-        self.assertIn("不要交给看图子代理", INSTRUCTIONS)
-        self.assertIn("不要为了凑组开子代理", INSTRUCTIONS)
+        self.assertIn("由当前模型看完并一次提交", INSTRUCTIONS)
+        self.assertIn("当前模型名", INSTRUCTIONS)
+        self.assertNotIn("cursor-grok", INSTRUCTIONS)
+        self.assertNotIn("子代理", INSTRUCTIONS)
         self.assertIn("挤不进前 10", INSTRUCTIONS)
         self.assertIn("chinese_name", tools["set_keywords"].parameters["properties"])
         self.assertIn(INSTRUCTIONS, server.instructions or "")
         hint = SellerAutoService(DelaySettings(), output_dir=tempfile.mkdtemp())._compare_message("listing", [])
-        self.assertIn("不要交给看图子代理", hint)
-        self.assertIn("不要为了凑组开子代理", hint)
+        self.assertIn("由当前模型看完这一批，一次提交", hint)
+        self.assertIn("当前模型名", hint)
+        self.assertNotIn("子代理", hint)
+        self.assertNotIn("cursor-grok", hint)
 
     def test_image_blocks_stay_images(self) -> None:
         from PIL import Image

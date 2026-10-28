@@ -160,6 +160,12 @@ class WorkbookTests(unittest.TestCase):
         self.assertFalse(can_enter_top(product, "+50 vendidos"))
         self.assertTrue(can_enter_top(product, "+100 vendidos"))
         self.assertTrue(can_enter_top(product, "+500 vendidos"))
+        for item in product["matches"]:
+            item["confidence"] = 0.5
+        self.assertFalse(can_enter_top(product, "+100 vendidos", confidence=0.4, candidate_id="newer"))
+        self.assertTrue(can_enter_top(product, "+100 vendidos", confidence=0.9, candidate_id="newer"))
+        self.assertFalse(can_enter_top(product, "+100 vendidos", confidence=0.5, candidate_id="m9"))
+        self.assertTrue(can_enter_top(product, "+100 vendidos", confidence=0.5, candidate_id="a"))
 
     def test_appends_a_row_with_price_links_and_listing_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -300,6 +306,34 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(fill_package_rows(path, [later]), 0)
             sheet = load_workbook(path)[TEMPLATE_SHEET]
             self.assertEqual(sheet.cell(3, _column(sheet, "名称")).value, "硅胶灶台缝隙盖\n（12单）")
+
+    def test_same_sku_and_links_are_not_appended_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.xlsx"
+            _mini_workbook(path)
+            product = _product()
+            self.assertEqual(write_product_workbook(path, [product]), 1)
+            self.assertEqual(write_product_workbook(path, [product]), 1)
+            sheet = load_workbook(path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(3, _column(sheet, "名称")).value, "硅胶灶台缝隙盖")
+            self.assertIsNone(sheet.cell(4, 1).value)
+
+    def test_fill_uses_sku_when_a_later_row_has_the_same_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.xlsx"
+            _mini_workbook(path, existing=None)
+            workbook = load_workbook(path)
+            sheet = workbook[TEMPLATE_SHEET]
+            sheet.cell(2, 1, "硅胶灶台缝隙盖")
+            sheet.cell(2, 2, "cubiertas hendidura para estufa")
+            sheet.cell(3, 1, "硅胶灶台缝隙盖")
+            sheet.cell(3, 2, "otra")
+            sheet.cell(3, 4, 9)
+            workbook.save(path)
+            self.assertEqual(fill_package_rows(path, [_product()]), 1)
+            sheet = load_workbook(path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(2, _column(sheet, "毛重")).value, 0.204)
+            self.assertEqual(sheet.cell(3, _column(sheet, "毛重")).value, 9)
 
     def test_template_file_is_still_the_working_sheet(self) -> None:
         self.assertEqual(template_path().name, "test.xlsx")

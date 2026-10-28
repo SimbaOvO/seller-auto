@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -18,7 +19,19 @@ ROOT = Path(__file__).resolve().parent.parent
 SOCKET_PATH = ROOT / "data" / "seller-auto.sock"
 PORT_PATH = ROOT / "data" / "seller-auto.port"
 PID_PATH = ROOT / "data" / "seller-auto.pid"
-CODE_REVISION = "win-platform-transport"
+def code_revision() -> str:
+    """源码一变，摘要就变，后台会重启后再接新代码。"""
+
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(root.glob("*.py")):
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+CODE_REVISION = code_revision()
 _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 

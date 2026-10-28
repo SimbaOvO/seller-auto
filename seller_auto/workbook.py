@@ -118,13 +118,34 @@ def sales_cutoff(product: dict[str, Any], limit: int = MKD_LINK_COUNT) -> int | 
     return sales_count(str(top[-1].get("sales_text") or ""))
 
 
-def can_enter_top(product: dict[str, Any], sales_text: str, limit: int = MKD_LINK_COUNT) -> bool:
-    """已记录同款是否挤得进销量前 10。写表取前 10 时用。"""
+def can_enter_top(
+    product: dict[str, Any],
+    sales_text: str,
+    confidence: float | None = None,
+    candidate_id: str = "",
+    limit: int = MKD_LINK_COUNT,
+) -> bool:
+    """已记录同款是否挤得进销量前 10。销量相同再比相似度。"""
 
     cutoff = sales_cutoff(product, limit)
     if cutoff is None:
         return True
-    return sales_count(sales_text) >= cutoff
+    count = sales_count(sales_text)
+    if count > cutoff:
+        return True
+    if count < cutoff:
+        return False
+    if confidence is None:
+        return True
+    top = ranked_matches(product, limit)
+    last = top[-1]
+    last_confidence = float(last.get("confidence") or last.get("similarity") or 0)
+    if float(confidence) > last_confidence:
+        return True
+    if float(confidence) < last_confidence:
+        return False
+    last_id = str(last.get("candidate_id") or last.get("url") or "")
+    return str(candidate_id or "") < last_id
 
 
 def order_count(product: dict[str, Any]) -> int | None:
@@ -192,15 +213,18 @@ def _find_product_row(sheet: Worksheet, roles: dict[str, int], product: dict[str
     sku_column = roles.get("sku")
     name_column = roles.get("name")
     last = _next_data_row(sheet)
-    hits: list[int] = []
+    sku_hits: list[int] = []
+    name_hits: list[int] = []
     for row in range(2, last):
         cell_sku = str(sheet.cell(row, sku_column).value or "").strip() if sku_column else ""
         cell_name = _name_key(sheet.cell(row, name_column).value) if name_column else ""
         if sku and cell_sku == sku:
-            hits.append(row)
-        elif name and cell_name == name:
-            hits.append(row)
-    return hits[-1] if hits else None
+            sku_hits.append(row)
+        elif not sku and name and cell_name == name:
+            name_hits.append(row)
+    if sku:
+        return sku_hits[-1] if sku_hits else None
+    return name_hits[-1] if name_hits else None
 
 
 def _fill_package_cells(
@@ -268,6 +292,52 @@ def fill_package_rows(path: Path, products: list[dict[str, Any]], *, replace_fba
     return updated
 
 
+def _listed_urls(product: dict[str, Any]) -> tuple[str, ...]:
+    found: list[str] = []
+    for match in ranked_matches(product):
+        url = public_url(str(match.get("url") or ""), str(match.get("key") or match.get("candidate_id") or ""))
+        if url:
+            found.append(url)
+    return tuple(found)
+
+
+def _sheet_urls(sheet: Worksheet, row: int, columns: list[int]) -> tuple[str, ...]:
+    found: list[str] = []
+    for column in columns:
+        value = str(sheet.cell(row, column).value or "").strip()
+        if value:
+            found.append(value)
+    return tuple(found)
+
+
+def _already_listed(
+    sheet: Worksheet,
+    roles: dict[str, int],
+    columns: list[int],
+    product: dict[str, Any],
+) -> bool:
+    """同一 SKU 和同一组美客多链接已经在表里时，不再追加一行。"""
+
+    wanted = _listed_urls(product)
+    if not wanted:
+        return False
+    sku = (product.get("keywords") or "").strip()
+    name = (product.get("chinese_name") or "").strip()
+    sku_column = roles.get("sku")
+    name_column = roles.get("name")
+    last = _next_data_row(sheet)
+    for row in range(2, last):
+        cell_sku = str(sheet.cell(row, sku_column).value or "").strip() if sku_column else ""
+        cell_name = _name_key(sheet.cell(row, name_column).value) if name_column else ""
+        if sku:
+            matched = cell_sku == sku
+        else:
+            matched = bool(name) and cell_name == name
+        if matched and _sheet_urls(sheet, row, columns) == wanted:
+            return True
+    return False
+
+
 def write_product_workbook(path: Path, products: list[dict[str, Any]], template: Path | None = None) -> int:
     rows = [product for product in products if ranked_matches(product, limit=1)]
     if not rows:
@@ -279,14 +349,19 @@ def write_product_workbook(path: Path, products: list[dict[str, Any]], template:
     headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
     roles = _roles(headers)
     row = _next_data_row(sheet)
+    placed = 0
     for product in rows:
+        if _already_listed(sheet, roles, mkd_columns, product):
+            placed += 1
+            continue
         _write_row(sheet, row, roles, mkd_columns, product)
+        placed += 1
         row += 1
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_file() and not os.access(path, os.W_OK):
         path.chmod(path.stat().st_mode | 0o200)
     workbook.save(path)
-    return len(rows)
+    return placed
 
 
 def _headers(template: Path) -> list[Any]:
