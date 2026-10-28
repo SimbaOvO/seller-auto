@@ -16,8 +16,11 @@ from seller_auto.service import ToolPayload
 
 ROOT = Path(__file__).resolve().parent.parent
 SOCKET_PATH = ROOT / "data" / "seller-auto.sock"
+PORT_PATH = ROOT / "data" / "seller-auto.port"
 PID_PATH = ROOT / "data" / "seller-auto.pid"
-CODE_REVISION = "enrich-browser-recover"
+CODE_REVISION = "win-platform-transport"
+_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
 def encode_message(payload: dict) -> bytes:
@@ -47,45 +50,96 @@ def _read_exact(connection: socket.socket, size: int) -> bytes:
 
 
 def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
-    except OSError:
+    except OSError as exc:
+        if sys.platform == "win32" and getattr(exc, "winerror", None) == 5:
+            return True
         return False
     return True
 
 
+def _read_pid() -> int:
+    if not PID_PATH.exists():
+        return 0
+    try:
+        return int(PID_PATH.read_text(encoding="utf-8").strip())
+    except ValueError:
+        return 0
+
+
+def _endpoint_ready() -> bool:
+    if sys.platform == "win32":
+        return PORT_PATH.is_file()
+    return SOCKET_PATH.exists()
+
+
+def remove_endpoint_files() -> None:
+    PID_PATH.unlink(missing_ok=True)
+    SOCKET_PATH.unlink(missing_ok=True)
+    PORT_PATH.unlink(missing_ok=True)
+
+
+def serve() -> socket.socket:
+    """监听本机命令。macOS 用套接字文件，Windows 用 127.0.0.1 的临时端口。"""
+
+    PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(4)
+        PORT_PATH.write_text(str(server.getsockname()[1]), encoding="utf-8")
+        return server
+    if SOCKET_PATH.exists():
+        SOCKET_PATH.unlink()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(SOCKET_PATH))
+    server.listen(4)
+    return server
+
+
+def connect(timeout: float | None = None) -> socket.socket:
+    if sys.platform == "win32":
+        port = int(PORT_PATH.read_text(encoding="utf-8").strip())
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if timeout is not None:
+            client.settimeout(timeout)
+        client.connect(("127.0.0.1", port))
+        return client
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    if timeout is not None:
+        client.settimeout(timeout)
+    client.connect(str(SOCKET_PATH))
+    return client
+
+
 def _clear_stale() -> None:
-    if PID_PATH.exists():
-        try:
-            pid = int(PID_PATH.read_text().strip())
-        except ValueError:
-            pid = 0
-        if not pid or not _pid_alive(pid):
-            PID_PATH.unlink(missing_ok=True)
-            SOCKET_PATH.unlink(missing_ok=True)
+    if not PID_PATH.exists():
+        return
+    if _pid_alive(_read_pid()):
+        return
+    remove_endpoint_files()
 
 
 def _ping() -> bool:
-    if not SOCKET_PATH.exists():
+    if not _endpoint_ready():
         return False
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(1)
-            client.connect(str(SOCKET_PATH))
+        with connect(timeout=1) as client:
             client.sendall(encode_message({"method": "ping", "params": {}}))
             reply = read_message(client)
         return reply.get("ok") is True
-    except OSError:
+    except (OSError, ConnectionError, json.JSONDecodeError, TimeoutError, ValueError):
         return False
 
 
 def _revision() -> str:
-    if not SOCKET_PATH.exists():
+    if not _endpoint_ready():
         return ""
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(1)
-            client.connect(str(SOCKET_PATH))
+        with connect(timeout=1) as client:
             client.sendall(encode_message({"method": "revision", "params": {}}))
             reply = read_message(client)
         return str(reply.get("revision") or "")
@@ -93,35 +147,53 @@ def _revision() -> str:
         return ""
 
 
-def _stop_daemon() -> None:
-    pid = 0
-    if PID_PATH.exists():
+def _stop_posix(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
         try:
-            pid = int(PID_PATH.read_text(encoding="utf-8").strip())
-        except ValueError:
-            pid = 0
-    if pid and _pid_alive(pid):
-        try:
-            os.killpg(pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGTERM)
         except OSError:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pid = 0
-        for _ in range(50):
-            if not pid or not _pid_alive(pid):
-                break
-            time.sleep(0.1)
-        if pid and _pid_alive(pid):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except OSError:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-    PID_PATH.unlink(missing_ok=True)
-    SOCKET_PATH.unlink(missing_ok=True)
+            return
+    for _ in range(50):
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _stop_windows(pid: int) -> None:
+    subprocess.run(
+        ["taskkill", "/PID", str(pid), "/T", "/F"],
+        capture_output=True,
+        text=True,
+        creationflags=_CREATE_NO_WINDOW,
+    )
+    if _pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(50):
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.1)
+
+
+def _stop_daemon() -> None:
+    pid = _read_pid()
+    if pid and _pid_alive(pid):
+        if sys.platform == "win32":
+            _stop_windows(pid)
+        else:
+            _stop_posix(pid)
+    remove_endpoint_files()
 
 
 def ensure_daemon() -> None:
@@ -138,14 +210,17 @@ def ensure_daemon() -> None:
     env["SELLER_AUTO_LOG"] = str(log_file)
     env["PLAYWRIGHT_BROWSERS_PATH"] = str(use_playwright_browsers())
     with log_file.open("a", encoding="utf-8") as handle:
-        subprocess.Popen(
-            [sys.executable, "-m", "seller_auto.daemon"],
-            cwd=str(ROOT),
-            env=env,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        kwargs: dict[str, object] = {
+            "cwd": str(ROOT),
+            "env": env,
+            "stdout": handle,
+            "stderr": subprocess.STDOUT,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen([sys.executable, "-m", "seller_auto.daemon"], **kwargs)
     for _ in range(50):
         if _ping():
             return
@@ -155,8 +230,7 @@ def ensure_daemon() -> None:
 
 def call(method: str, params: dict | None = None) -> ToolPayload:
     ensure_daemon()
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.connect(str(SOCKET_PATH))
+    with connect() as client:
         client.sendall(encode_message({"method": method, "params": params or {}}))
         reply = read_message(client)
     if not reply.get("ok", True) and "error" in reply and "data" not in reply:

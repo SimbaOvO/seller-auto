@@ -5,11 +5,20 @@ from __future__ import annotations
 import os
 import signal
 import socket
+import sys
 import threading
 import traceback
 
 from seller_auto.browser_launch import use_playwright_browsers
-from seller_auto.ipc import CODE_REVISION, PID_PATH, SOCKET_PATH, encode_message, payload_to_message, read_message
+from seller_auto.ipc import (
+    CODE_REVISION,
+    PID_PATH,
+    encode_message,
+    payload_to_message,
+    read_message,
+    remove_endpoint_files,
+    serve,
+)
 from seller_auto.pacing import DelaySettings
 from seller_auto.service import SellerAutoService
 from seller_auto.step_log import step
@@ -18,21 +27,20 @@ from seller_auto.step_log import step
 def main() -> None:
     os.environ["SELLER_AUTO_DAEMON"] = "1"
     use_playwright_browsers()
-    SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
-    if SOCKET_PATH.exists():
-        SOCKET_PATH.unlink()
     settings = DelaySettings.from_argv()
     service = SellerAutoService(settings)
 
     def _shutdown(signum: int, _frame: object) -> None:
         raise SystemExit(signum)
 
-    signal.signal(signal.SIGTERM, _shutdown)
+    if sys.platform == "win32":
+        signal.signal(signal.SIGBREAK, _shutdown)
+    else:
+        signal.signal(signal.SIGTERM, _shutdown)
     step("后台", f"已启动，日志 {os.environ.get('SELLER_AUTO_LOG', 'logs/seller-auto.log')}")
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(SOCKET_PATH))
-    server.listen(4)
+    server = serve()
     work = threading.Lock()
     try:
         while True:
@@ -40,8 +48,7 @@ def main() -> None:
             threading.Thread(target=_handle_connection, args=(connection, service, work), daemon=True).start()
     finally:
         server.close()
-        SOCKET_PATH.unlink(missing_ok=True)
-        PID_PATH.unlink(missing_ok=True)
+        remove_endpoint_files()
         service.close()
         step("后台", "已退出")
 

@@ -22,6 +22,7 @@ from seller_auto.amazon import (
     title_locator,
 )
 from seller_auto.browser import NEEDS_HUMAN, ArgentinaBrowser, browser_closed_error, log
+from seller_auto.browser_launch import playwright_install_command
 from seller_auto.categories import category_reason, classify_breadcrumb
 from seller_auto.images import save_original, to_client_jpeg
 from seller_auto.lingdong import apply_last_mile, collect_market_quotes, quote_links
@@ -211,7 +212,7 @@ class SellerAutoService:
             log(traceback.format_exc())
             message = str(exc)
             if "Executable doesn't exist" in message or "browserType.launch" in message:
-                message = f"{message}。请先在项目目录执行 .venv/bin/python -m playwright install chromium"
+                message = f"{message}。请先在项目目录执行 {playwright_install_command()}"
             step("错误", message)
             return ToolPayload({"ok": False, "status": "error", "message": message})
 

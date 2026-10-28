@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -123,7 +124,13 @@ class PackageBackfillTests(unittest.TestCase):
             enrich = Path(str(profile) + "-enrich")
             (enrich / "Default").mkdir(parents=True)
             (enrich / "Default" / "Cookies").write_bytes(b"cookie")
-            (enrich / "SingletonLock").symlink_to(f"host-{__import__('os').getpid()}")
+            (enrich / "lockfile").write_bytes(b"lock")
+            linked = False
+            try:
+                (enrich / "SingletonLock").symlink_to(f"host-{os.getpid()}")
+                linked = True
+            except OSError:
+                (enrich / "SingletonLock").write_text("locked", encoding="utf-8")
             with (
                 mock.patch("seller_auto.package_backfill.ArgentinaBrowser", FakeBrowser),
                 mock.patch("seller_auto.package_backfill.open_competitor", return_value=(None, None)),
@@ -140,5 +147,10 @@ class PackageBackfillTests(unittest.TestCase):
             self.assertEqual(len(opened), 1)
             self.assertEqual(opened[0].name, "profile-enrich-backfill")
             self.assertNotEqual(opened[0], enrich)
-            self.assertTrue((enrich / "SingletonLock").is_symlink())
+            self.assertTrue((enrich / "lockfile").is_file())
+            self.assertFalse((opened[0] / "lockfile").exists())
             self.assertFalse((opened[0] / "SingletonLock").exists())
+            if linked:
+                self.assertTrue((enrich / "SingletonLock").is_symlink())
+            else:
+                self.assertTrue((enrich / "SingletonLock").is_file())

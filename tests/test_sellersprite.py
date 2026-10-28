@@ -8,14 +8,12 @@ from playwright.sync_api import sync_playwright
 
 
 def _chrome_for_testing() -> str:
-    matches = sorted(
-        (Path.home() / "Library/Caches/ms-playwright").glob(
-            "chromium-*/chrome-mac-*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
-        )
-    )
-    if not matches:
+    from seller_auto.browser_launch import chrome_for_testing_binary, default_playwright_browsers_dir
+
+    binary = chrome_for_testing_binary(default_playwright_browsers_dir())
+    if binary is None:
         raise unittest.SkipTest("本机没有 Chrome for Testing，跳过表头读取测试")
-    return str(matches[-1])
+    return str(binary)
 
 from seller_auto.sellersprite import (
     LOOKUP_STATE_JS,

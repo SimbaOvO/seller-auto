@@ -5,9 +5,15 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import re
 import shutil
+import stat
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
+
+from seller_auto.step_log import step
 
 # 和 mercadolibre-login 一样：隐藏 webdriver、HeadlessChrome，并让后台页面保持可见。
 STEALTH_JS = """
@@ -32,15 +38,54 @@ LAUNCH_ARGS = [
     "--lang=es-AR",
 ]
 
-CHROME_FOR_TESTING = (
-    "chromium-*/chrome-mac-*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+_CHROME_GLOBS = (
+    "chromium-*/chrome-mac-*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    "chromium-*/chrome-win64/chrome.exe",
+    "chromium-*/chrome-win/chrome.exe",
+)
+_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+\.\d+)")
+_LOGIN_FILES = frozenset(
+    {
+        "Local State",
+        "Default/Preferences",
+        "Default/Cookies",
+        "Default/Network/Cookies",
+        "Default/Login Data",
+    }
 )
 
 
 def default_playwright_browsers_dir() -> Path:
     """Playwright 未设置 PLAYWRIGHT_BROWSERS_PATH 时使用的目录。"""
 
-    return Path.home() / "Library/Caches/ms-playwright"
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            return Path(local) / "ms-playwright"
+        return Path.home() / "AppData" / "Local" / "ms-playwright"
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Caches/ms-playwright"
+    return Path.home() / ".cache" / "ms-playwright"
+
+
+def playwright_install_command() -> str:
+    if sys.platform == "win32":
+        return r".venv\Scripts\python.exe -m playwright install chromium"
+    return ".venv/bin/python -m playwright install chromium"
+
+
+def _chromium_revision(path: Path) -> int:
+    for part in path.parts:
+        if not part.startswith("chromium-"):
+            continue
+        digits = ""
+        for character in part.removeprefix("chromium-"):
+            if not character.isdigit():
+                break
+            digits += character
+        if digits:
+            return int(digits)
+    return 0
 
 
 def is_sandbox_browsers_path(path: str | Path) -> bool:
@@ -48,8 +93,12 @@ def is_sandbox_browsers_path(path: str | Path) -> bool:
 
 
 def chrome_for_testing_binary(browsers_dir: Path) -> Path | None:
-    matches = sorted(browsers_dir.glob(CHROME_FOR_TESTING))
-    return matches[-1] if matches else None
+    matches: list[Path] = []
+    for pattern in _CHROME_GLOBS:
+        matches.extend(browsers_dir.glob(pattern))
+    if not matches:
+        return None
+    return max(matches, key=lambda path: (_chromium_revision(path), str(path)))
 
 
 def playwright_browsers_dir() -> Path:
@@ -72,9 +121,15 @@ def use_playwright_browsers() -> Path:
     return browsers
 
 
-def desktop_chrome_user_agent(version: str) -> str:
-    """本机是 macOS，请求头用普通桌面 Chrome，去掉 HeadlessChrome。"""
+def desktop_chrome_user_agent(version: str, system: str | None = None) -> str:
+    """请求头用本机桌面 Chrome，去掉 HeadlessChrome。"""
 
+    if (system or sys.platform) == "win32":
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{version} Safari/537.36"
+        )
     return (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -84,19 +139,44 @@ def desktop_chrome_user_agent(version: str) -> str:
 
 def read_chromium_version(browsers_dir: Path) -> str | None:
     plists = sorted(
-        browsers_dir.glob("chromium-*/chrome-mac-*/Google Chrome for Testing.app/Contents/Info.plist")
+        browsers_dir.glob("chromium-*/chrome-mac-*/Google Chrome for Testing.app/Contents/Info.plist"),
+        key=_chromium_revision,
     )
-    if not plists:
+    if plists:
+        try:
+            info = plistlib.loads(plists[-1].read_bytes())
+        except (OSError, plistlib.InvalidFileException):
+            info = None
+        if isinstance(info, dict):
+            version = info.get("CFBundleShortVersionString") or info.get("CFBundleVersion")
+            if version:
+                return str(version)
+    binary = chrome_for_testing_binary(browsers_dir)
+    if binary is None:
         return None
+    return _version_from_binary(binary)
+
+
+def _version_from_binary(binary: Path) -> str | None:
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 15,
+        "check": False,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     try:
-        info = plistlib.loads(plists[-1].read_bytes())
-    except (OSError, plistlib.InvalidFileException):
+        completed = subprocess.run([str(binary), "--version"], **kwargs)
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    version = info.get("CFBundleShortVersionString") or info.get("CFBundleVersion")
-    return str(version) if version else None
+    match = _VERSION_RE.search(completed.stdout or completed.stderr or "")
+    return match.group(1) if match else None
 
 
 def profile_lock_pid(profile: Path) -> int | None:
+    if sys.platform == "win32":
+        return None
     try:
         target = os.readlink(profile / "SingletonLock")
     except OSError:
@@ -105,7 +185,34 @@ def profile_lock_pid(profile: Path) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
+def _windows_profile_locked(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        handle = open(path, "r+b")
+    except OSError:
+        return True
+    try:
+        import msvcrt
+
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return True
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        return False
+    finally:
+        handle.close()
+
+
 def profile_is_busy(profile: Path) -> bool:
+    if sys.platform == "win32":
+        return _windows_profile_locked(profile / "lockfile")
     pid = profile_lock_pid(profile)
     if pid is None:
         return False
@@ -117,7 +224,7 @@ def profile_is_busy(profile: Path) -> bool:
 
 
 def _skip_profile_entry(name: str) -> bool:
-    if name.startswith("Singleton"):
+    if name.startswith("Singleton") or name == "lockfile":
         return True
     return name in {
         "Cache",
@@ -134,16 +241,31 @@ def _skip_profile_entry(name: str) -> bool:
     }
 
 
+def _remove_tree(path: Path) -> None:
+    def _on_remove(func: Any, failed: str, _exc: BaseException) -> None:
+        try:
+            os.chmod(failed, stat.S_IWRITE)
+            func(failed)
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onexc=_on_remove)
+
+
 def snapshot_profile(source: Path, destination: Path) -> Path:
     """复制登录态到另一个目录。不带进程锁，第二只 Chrome 就不会关掉正在用的那只。"""
 
     if source.resolve() == destination.resolve():
         return destination
+    if destination.exists() and profile_is_busy(destination):
+        step("资料", "回填配置仍在使用，沿用现有目录")
+        return destination
     if destination.exists():
-        shutil.rmtree(destination, ignore_errors=True)
+        _remove_tree(destination)
     destination.mkdir(parents=True, exist_ok=True)
     if not source.is_dir():
         return destination
+    missed: list[str] = []
     for dirpath, dirnames, filenames in os.walk(source):
         relative = Path(dirpath).relative_to(source)
         dirnames[:] = [name for name in dirnames if not _skip_profile_entry(name)]
@@ -152,10 +274,15 @@ def snapshot_profile(source: Path, destination: Path) -> Path:
         for name in filenames:
             if _skip_profile_entry(name):
                 continue
+            relative_file = (relative / name).as_posix()
             try:
                 shutil.copy2(Path(dirpath) / name, target_dir / name)
             except OSError:
+                if relative_file in _LOGIN_FILES:
+                    missed.append(relative_file)
                 continue
+    if missed:
+        step("资料", "这些登录文件没有复制过去，回填浏览器需要重新登录：" + "、".join(missed))
     return destination
 
 
@@ -179,7 +306,11 @@ def mark_clean_shutdown(profile: Path) -> bool:
     prefs["profile"] = profile_prefs
     temporary = prefs_path.with_name(f"{prefs_path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(prefs), encoding="utf-8")
-    temporary.replace(prefs_path)
+    try:
+        temporary.replace(prefs_path)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        return False
     return True
 
 

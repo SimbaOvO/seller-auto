@@ -8,15 +8,27 @@
 
 需要 Python 3.13。
 
+macOS：
+
 ```bash
 python3.13 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m playwright install chromium
 ```
 
+Windows：
+
+```bat
+py -3.13 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m playwright install chromium
+```
+
+macOS 上已经登录过的 `data/profile` 不要拷到 Windows。卖家精灵、美客多和蓝鲸需要在 Windows 上重新登录。
+
 ## 在 Cursor 里使用
 
-项目自带 [`.cursor/mcp.json`](.cursor/mcp.json)，服务名是 `seller-auto`。启用后，检索元素和对比主图都使用 grok 4.5 low fast，模型名写 `cursor-grok-4.5-low-fast`。在对话里说：
+项目自带 [`.cursor/mcp.json`](.cursor/mcp.json)，服务名是 `seller-auto`。它用 `python3` 运行 `scripts/launch_mcp.py`，再转到虚拟环境里的解释器。Windows 上如果没有 `python3` 这个命令，把 `command` 改成 `python`。启用后，检索元素和对比主图都使用 grok 4.5 low fast，模型名写 `cursor-grok-4.5-low-fast`。在对话里说：
 
 ```text
 处理这个店铺id：A1A10HFD4KEZW5
@@ -40,6 +52,14 @@ python3.13 -m venv .venv
 
 ## 测试
 
+macOS：
+
 ```bash
 .venv/bin/python -m unittest discover -s tests
+```
+
+Windows：
+
+```bat
+.venv\Scripts\python.exe -m unittest discover -s tests
 ```
