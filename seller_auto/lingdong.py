@@ -13,6 +13,8 @@ from seller_auto.storage import public_url
 from seller_auto.workbook import dimension_cm, lowest_selling_price, ranked_matches, weight_kg
 
 ALL_ITEMS_URL = "https://xp.lingdongsz.com/#/allItems"
+LOGIN_EXPIRED_NOTICE = "蓝鲸登录已失效，右上角是注册/登录。已跳过单量，继续后面的步骤。"
+LOGIN_SKIPPED_NOTICE = "蓝鲸未登录，已跳过单量，继续后面的步骤。"
 _VIEWPORT = {"width": 1600, "height": 1000}
 _ITEM_ID = re.compile(r"(ML[A-Z])-?(\d{3,})", re.IGNORECASE)
 _ARS = re.compile(r"ARS\s*([0-9][0-9.,]*)", re.IGNORECASE)
@@ -73,6 +75,14 @@ _GATE_JS = r"""
     if ([...node.querySelectorAll("input, textarea")].some(shown)) return "ready";
     node = node.parentElement;
   }
+  const loggedOut = [...document.querySelectorAll("a, button, span, div")].some((el) => {
+    const text = (el.innerText || el.textContent || "").replace(/\s+/g, "");
+    if (text !== "注册/登录") return false;
+    if (!shown(el)) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.top >= 0 && rect.top < 200 && rect.right > window.innerWidth * 0.55;
+  });
+  if (loggedOut) return "expired";
   const hash = location.hash || "";
   const password = document.querySelector('input[type="password"]');
   if (hash.includes("/login") || (password && password.getClientRects().length > 0)) return "login";
@@ -173,6 +183,10 @@ _STATUS_ALL_JS = r"""
 
 class LingdongError(RuntimeError):
     pass
+
+
+class LingdongLoginSkipped(LingdongError):
+    """未登录时跳过单量，表格、运费和后面的商品继续。"""
 
 
 def item_id(value: str) -> str:
@@ -491,7 +505,7 @@ def _wait_gate(page: Any, timeout_ms: int) -> str:
     except PlaywrightTimeout:
         return "timeout"
     value = handle.json_value()
-    if value in {"ready", "login"}:
+    if value in {"ready", "login", "expired"}:
         return str(value)
     return "timeout"
 
@@ -505,17 +519,18 @@ def _open_page(browser: Any) -> Any:
         step("蓝鲸", "没有改成中文请求头")
     browser.goto(page, ALL_ITEMS_URL)
     gate = _wait_gate(page, 25000)
-    if gate == "login":
-        step("蓝鲸", "需要登录，请在前台窗口完成")
-        page = browser.reveal(page, "蓝鲸选品需要登录，暂时打开前台窗口")
-        _viewport(page)
-        gate = _wait_gate(page, 180000)
-        if gate != "ready":
-            raise LingdongError("蓝鲸选品需要登录后才能查询商品链接")
-        page = browser.restore_background(page)
-        _viewport(page)
-        if _wait_gate(page, 25000) != "ready":
-            raise LingdongError("回到后台后没有再看到商品链接")
+    if gate in {"login", "expired"}:
+        notice = LOGIN_EXPIRED_NOTICE if gate == "expired" else LOGIN_SKIPPED_NOTICE
+        if gate == "expired":
+            step("蓝鲸", "登录已失效，右上角是注册/登录，跳过单量")
+        else:
+            step("蓝鲸", "未登录，跳过单量")
+        browser.pending_notice = notice
+        try:
+            browser.close_detail()
+        except Exception:
+            step("蓝鲸", "关闭蓝鲸标签失败")
+        raise LingdongLoginSkipped(notice)
     elif gate != "ready":
         raise LingdongError("蓝鲸选品页面没有出现商品链接")
     return page

@@ -25,7 +25,7 @@ from seller_auto.browser import NEEDS_HUMAN, ArgentinaBrowser, browser_closed_er
 from seller_auto.browser_launch import playwright_install_command
 from seller_auto.categories import category_reason, classify_breadcrumb
 from seller_auto.images import save_original, to_client_jpeg
-from seller_auto.lingdong import apply_last_mile, collect_market_quotes, quote_links
+from seller_auto.lingdong import LingdongLoginSkipped, apply_last_mile, collect_market_quotes, quote_links
 from seller_auto.matches import (
     TITLE_FILTER_MODEL,
     TITLE_MISMATCH_REASON,
@@ -322,6 +322,9 @@ class SellerAutoService:
         current = self.state if state is None else state
         if current is not None:
             data = {**self._status_from(current), **data}
+        notice = self._take_pending_notice()
+        if notice and notice not in str(data.get("message") or ""):
+            data["message"] = f"{data.get('message') or ''} {notice}".strip()
         encoded: list[tuple[str, bytes]] = []
         for caption, path in images or []:
             jpeg = _jpeg_file(path)
@@ -331,6 +334,21 @@ class SellerAutoService:
         if status:
             step(str(status), str(data.get("message") or ""))
         return ToolPayload(data, encoded)
+
+    def _set_pending_notice(self, text: str) -> None:
+        browser = self.enrich_browser
+        if browser is None or not text:
+            return
+        browser.pending_notice = text
+
+    def _take_pending_notice(self) -> str:
+        browser = self.enrich_browser
+        if browser is None:
+            return ""
+        notice = str(getattr(browser, "pending_notice", "") or "").strip()
+        if notice:
+            browser.pending_notice = ""
+        return notice
 
     def _blocked(self, blocked: dict[str, Any]) -> ToolPayload:
         self._save()
@@ -658,6 +676,11 @@ class SellerAutoService:
             return ""
         try:
             return self._run_market_quotes(jobs)
+        except LingdongLoginSkipped as exc:
+            text = str(exc)
+            step("蓝鲸", text)
+            self._set_pending_notice(text)
+            return text
         except Exception as exc:
             step("蓝鲸", f"查询失败：{exc}")
             log(traceback.format_exc())

@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from openpyxl import Workbook, load_workbook
 
 from seller_auto.lingdong import (
+    LOGIN_EXPIRED_NOTICE,
+    LingdongLoginSkipped,
     _GATE_JS,
     _TABLE_JS,
     _query_cooldown,
@@ -320,6 +322,54 @@ class LingdongExportTests(unittest.TestCase):
             self.assertEqual(sheet.cell(2, 1).value, "烫衣板套")
             self.assertEqual(sheet.cell(2, 2).value, 1430)
 
+    def test_expired_login_is_logged_and_attached_to_the_next_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook_path = root / "book.xlsx"
+            _workbook(workbook_path)
+            service = SellerAutoService(DelaySettings(), output_dir=str(root), workbook_path=str(workbook_path))
+            state = _new_state("sess", "SELLER1", "https://www.amazon.com.mx/s?me=SELLER1")
+            state["single_product"] = "B0TEST1234"
+            state["product_order"] = ["B0TEST1234"]
+            state["current_product_id"] = "B0TEST1234"
+            state["products"]["B0TEST1234"] = {
+                "product_id": "B0TEST1234",
+                "chinese_name": "仿真芋头盆栽",
+                "keywords": "planta",
+                "listing": {"page1_done": True, "page2_done": True, "candidates": [], "next_index": 0},
+                "judged_ids": [],
+                "matches": [
+                    {
+                        "candidate_id": "one",
+                        "url": "https://www.mercadolibre.com.ar/p/MLA2006591099",
+                        "sales_text": "+5 vendidos",
+                        "price": 9500,
+                        "confidence": 0.9,
+                    }
+                ],
+            }
+            service.state = state
+            service._save()
+            service.enrich_browser = SimpleNamespace(pending_notice="")
+
+            def fake(jobs: list[dict]) -> str:
+                raise LingdongLoginSkipped(LOGIN_EXPIRED_NOTICE)
+
+            service._run_market_quotes = fake
+            service.export_results()
+            payload_data = _wait_export(service)
+            self.assertIn("登录已失效", payload_data["message"])
+            self.assertIn("已跳过单量", payload_data["message"])
+            sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(2, 1).value, "仿真芋头盆栽")
+            self.assertEqual(service.enrich_browser.pending_notice, LOGIN_EXPIRED_NOTICE)
+            told = service._payload({"ok": True, "status": "amazon_product", "message": "下一条亚马逊商品已打开。"})
+            self.assertIn("蓝鲸登录已失效，右上角是注册/登录", told.data["message"])
+            self.assertIn("下一条亚马逊商品已打开", told.data["message"])
+            self.assertEqual(service.enrich_browser.pending_notice, "")
+            again = service._payload({"ok": True, "status": "status", "message": "进度已更新。"})
+            self.assertNotIn("登录已失效", again.data["message"])
+
     def test_export_without_links_skips_lingdong(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -515,6 +565,14 @@ class LingdongPageTests(unittest.TestCase):
                 self.assertEqual(link.get_attribute("id"), "link-box")
                 page.evaluate("() => { location.hash = '#/login'; document.body.innerHTML = '<input type=\"password\">'; }")
                 self.assertEqual(page.evaluate(_GATE_JS), "login")
+                page.set_viewport_size({"width": 1600, "height": 900})
+                page.evaluate(
+                    """() => {
+                      location.hash = '';
+                      document.body.innerHTML = '<button id="account" style="position:fixed;top:12px;right:16px">注册/登录</button>';
+                    }"""
+                )
+                self.assertEqual(page.evaluate(_GATE_JS), "expired")
                 page.evaluate("() => { location.hash = ''; document.body.innerHTML = '<span class=\"label\">商品链接</span>'; }")
                 self.assertIsNone(page.evaluate(_GATE_JS))
             finally:

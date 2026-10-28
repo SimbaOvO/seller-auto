@@ -95,6 +95,7 @@ class ArgentinaBrowser:
         self.detail_page: Any = None
         self.challenge_pending = False
         self.challenge_site = ""
+        self.pending_notice = ""
 
     def start(self) -> None:
         if self.context is not None:
