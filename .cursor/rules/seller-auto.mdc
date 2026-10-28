@@ -5,7 +5,7 @@ alwaysApply: true
 
 # seller-auto 模型
 
-风控间隔保持原样：亚马逊点击之间 8–15 秒，美客多搜索、翻页、打开详情和广告详情之间 12–25 秒。不要为了提速删掉这些等待，也不要每条链接新开一个浏览器窗口。浏览器默认在后台运行，使用完整的 Chrome for Testing，不用 headless shell。去掉 webdriver 和 HeadlessChrome 这些自动化标记；不要伪造画布、WebGL 或操作系统。需要手动验证时才短暂打开前台窗口，完成后回到后台。
+风控间隔保持原样：亚马逊点击之间 8–15 秒，美客多搜索、翻页、打开详情和广告详情之间 12–25 秒，蓝鲸每次点查询之前 8–15 秒。不要为了提速删掉这些等待，也不要每条链接新开一个浏览器窗口。浏览器默认在后台运行，使用完整的 Chrome for Testing，不用 headless shell。去掉 webdriver 和 HeadlessChrome 这些自动化标记；不要伪造画布、WebGL 或操作系统。需要手动验证时才短暂打开前台窗口，完成后回到后台。
 
 检索目标元素和判断广告位标题使用 grok 4.5 low fast。模型 id 是 `grok-4.5`，参数 `effort=low`、`fast=true`。名字写 `cursor-grok-4.5-low-fast`，不要只写 `grok-4.5`。
 

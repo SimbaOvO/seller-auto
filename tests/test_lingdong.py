@@ -5,12 +5,14 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from openpyxl import Workbook, load_workbook
 
 from seller_auto.lingdong import (
     _GATE_JS,
     _TABLE_JS,
+    _query_cooldown,
     apply_last_mile,
     chargeable_kilograms,
     choose_quote_row,
@@ -23,7 +25,7 @@ from seller_auto.lingdong import (
     table_decision,
     total_orders,
 )
-from seller_auto.pacing import DelaySettings
+from seller_auto.pacing import Cooldown, DelaySettings
 from seller_auto.service import SellerAutoService, _new_state
 from seller_auto.workbook import TEMPLATE_SHEET, display_name
 
@@ -115,6 +117,41 @@ class LingdongParseTests(unittest.TestCase):
         )
         self.assertEqual(fields["length"], 21.4)
         self.assertEqual(fields["weight"], 0.213)
+
+    def test_each_query_waits_like_an_amazon_click(self) -> None:
+        clock = {"t": 0.0}
+        slept: list[float] = []
+        samples = iter([9.0, 14.0, 8.0, 11.0])
+
+        def sleep(seconds: float) -> None:
+            slept.append(seconds)
+            clock["t"] += seconds
+
+        cooldown = Cooldown(
+            8,
+            15,
+            sleep=sleep,
+            now=lambda: clock["t"],
+            rng=lambda _low, _high: next(samples),
+            label="蓝鲸",
+        )
+        browser = SimpleNamespace(lingdong_cooldown=cooldown)
+        _query_cooldown(browser).acquire()
+        clock["t"] += 2
+        _query_cooldown(browser).acquire()
+        self.assertEqual(slept, [9.0, 12.0])
+
+        clock["t"] = 100.0
+        _query_cooldown(browser).acquire()
+        self.assertEqual(slept, [9.0, 12.0])
+
+    def test_query_cooldown_uses_the_amazon_interval(self) -> None:
+        browser = SimpleNamespace(settings=DelaySettings())
+        cooldown = _query_cooldown(browser)
+        self.assertEqual((cooldown.min_seconds, cooldown.max_seconds), (8, 15))
+        self.assertEqual(cooldown.label, "蓝鲸")
+        self.assertIs(browser.lingdong_cooldown, cooldown)
+        self.assertIsNotNone(cooldown.ready_at)
 
     def test_table_waits_for_a_real_refresh(self) -> None:
         before = "MLA1:10:100:False"

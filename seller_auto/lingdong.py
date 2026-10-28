@@ -7,6 +7,7 @@ import time
 import traceback
 from typing import Any
 
+from seller_auto.pacing import Cooldown
 from seller_auto.step_log import step
 from seller_auto.storage import public_url
 from seller_auto.workbook import dimension_cm, lowest_selling_price, ranked_matches, weight_kg
@@ -343,7 +344,7 @@ def collect_market_quotes(browser: Any, jobs: list[tuple[list[str], dict[str, An
         results: list[dict[str, Any]] = []
         for links, package in jobs:
             try:
-                results.append(_quote_on_page(page, links, package))
+                results.append(_quote_on_page(page, links, package, browser))
             except Exception as exc:
                 _fail("这一条没查成", exc)
                 results.append({"orders": None, "fba_fee": None})
@@ -592,12 +593,12 @@ def _reset_button(page: Any) -> Any:
     )
 
 
-def _quote_on_page(page: Any, links: list[str], package: dict[str, Any] | None) -> dict[str, Any]:
+def _quote_on_page(page: Any, links: list[str], package: dict[str, Any] | None, browser: Any) -> dict[str, Any]:
     hits: list[dict[str, Any]] = []
     for index, batch in enumerate(link_batches(links), start=1):
         step("蓝鲸", f"第 {index} 批商品链接，共 {len(batch)} 条")
         for url in batch:
-            row = _search_row(page, url)
+            row = _search_row(page, url, browser)
             if row is None:
                 step("蓝鲸", f"没有对应商品行：{item_id(url) or url}")
                 continue
@@ -612,7 +613,27 @@ def _quote_on_page(page: Any, links: list[str], package: dict[str, Any] | None) 
     return {"orders": orders}
 
 
-def _search_row(page: Any, url: str) -> dict[str, Any] | None:
+def _query_cooldown(browser: Any) -> Cooldown:
+    """蓝鲸每次点查询之前等 8–15 秒，和亚马逊点击同一档。"""
+
+    cooldown = getattr(browser, "lingdong_cooldown", None)
+    if isinstance(cooldown, Cooldown):
+        if cooldown.ready_at is None:
+            cooldown.ready_at = cooldown._now() + cooldown.sample()
+        return cooldown
+    settings = getattr(browser, "settings", None)
+    low = float(getattr(settings, "amazon_min_delay", 8))
+    high = float(getattr(settings, "amazon_max_delay", 15))
+    cooldown = Cooldown(low, high, label="蓝鲸")
+    cooldown.ready_at = cooldown._now() + cooldown.sample()
+    try:
+        browser.lingdong_cooldown = cooldown
+    except Exception:
+        step("蓝鲸", "没有记上查询间隔")
+    return cooldown
+
+
+def _search_row(page: Any, url: str, browser: Any) -> dict[str, Any] | None:
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
     field = _link_input(page)
@@ -620,6 +641,7 @@ def _search_row(page: Any, url: str) -> dict[str, Any] | None:
     field.fill(url)
     if field.input_value() != url:
         field.evaluate(_SET_VALUE_JS, url)
+    _query_cooldown(browser).acquire()
     before = page.evaluate(_TABLE_JS)
     before_sig = _signature(before)
     start = page.evaluate("() => window.__ldNet || 0")
