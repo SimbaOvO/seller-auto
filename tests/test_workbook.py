@@ -244,6 +244,26 @@ class WorkbookTests(unittest.TestCase):
             self.assertIsNone(sheet.cell(3, _column(sheet, "投产比")).fill.patternType)
             self.assertEqual(sheet.cell(3, _column(sheet, "投产比")).number_format, "0.00%")
 
+    def test_image_id_in_formula_is_not_rewritten_as_a_column(self) -> None:
+        image_formula = '=_xlfn.DISPIMG("ID_FE9D203325754300B5CBEC8EB318FCA6",1)'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.xlsx"
+            _mini_workbook(path)
+            workbook = load_workbook(path)
+            sheet = workbook[TEMPLATE_SHEET]
+            sheet.cell(2, _column(sheet, "预计方数"), image_formula)
+            workbook.save(path)
+            write_product_workbook(path, [_product()])
+            sheet = load_workbook(path)[TEMPLATE_SHEET]
+            saved = [
+                cell.value
+                for row in sheet.iter_rows(min_row=2, max_row=3)
+                for cell in row
+                if isinstance(cell.value, str) and "DISPIMG" in cell.value
+            ]
+            self.assertTrue(saved)
+            self.assertTrue(all("B5CBEC8EB318FCA6" in value for value in saved))
+
     def test_formula_columns_copy_the_previous_row(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.xlsx"

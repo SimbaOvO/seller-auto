@@ -212,7 +212,7 @@ def _stop_daemon() -> None:
 def ensure_daemon() -> None:
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     if _ping():
-        if _revision() == CODE_REVISION:
+        if _revision() == code_revision():
             return
         _stop_daemon()
     _clear_stale()

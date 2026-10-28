@@ -65,3 +65,32 @@ class BrowserRecoveryTests(unittest.TestCase):
             browser.start()
         self.assertIs(browser.context, alive)
         playwright.chromium.launch_persistent_context.assert_called_once()
+
+    def test_search_grid_is_not_a_verification_page(self) -> None:
+        browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
+        page = mock.Mock()
+        page.locator.return_value.count.return_value = 8
+        page.url = "https://listado.mercadolibre.com.ar/panel-perforado-para-pared"
+        self.assertFalse(browser.needs_verification(page))
+
+    def test_verification_shows_the_same_page(self) -> None:
+        browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
+        page = mock.Mock()
+        browser.list_page = page
+        browser.headless = True
+        with mock.patch.object(browser, "_bring_forward") as forward:
+            shown = browser._show_for_verification(page)
+        self.assertIs(shown, page)
+        self.assertFalse(browser.headless)
+        forward.assert_called_once_with(page)
+
+    def test_background_hides_without_relaunch(self) -> None:
+        browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
+        page = mock.Mock()
+        browser.list_page = page
+        browser.headless = False
+        browser.background = True
+        with mock.patch.object(browser, "_keep_background") as park:
+            browser._return_to_background(page)
+        self.assertTrue(browser.headless)
+        park.assert_called_once_with()

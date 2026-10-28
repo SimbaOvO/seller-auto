@@ -1174,6 +1174,7 @@ class SellerAutoService:
                 return blocked
             self._scroll_results()
             cards = collect_grid_cards(browser.list_page)
+            step("美客多", f"第 1 页解析到 {len(cards)} 个商品链接")
             self._add_candidates(product, cards, 1)
             listing["page1_done"] = True
             self._save()
@@ -1210,6 +1211,7 @@ class SellerAutoService:
         if moved:
             self._scroll_results()
             cards = collect_grid_cards(browser.list_page)
+            step("美客多", f"第 2 页解析到 {len(cards)} 个商品链接")
             self._add_candidates(product, cards, 2)
         with self._state_lock:
             listing["page2_done"] = True

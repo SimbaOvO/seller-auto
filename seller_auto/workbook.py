@@ -405,7 +405,21 @@ def _ensure_mkd_columns(sheet: Worksheet, count: int = MKD_LINK_COUNT) -> list[i
     return _mkd_columns(headers)[:count]
 
 
-_CELL_REF = re.compile(r"(\$?)([A-Z]+)(\$?)(\d+)")
+_QUOTED = re.compile(r'"(?:[^"]|"")*"')
+_CELL_REF = re.compile(r"(?<![A-Z0-9_])(\$?)([A-Z]{1,3})(\$?)(\d+)")
+
+
+def _rewrite_cell_refs(formula: str, replace: Any) -> str:
+    """只改引号外的单元格。图片 ID 里的 CBEC8 不是列号。"""
+
+    pieces: list[str] = []
+    cursor = 0
+    for quoted in _QUOTED.finditer(formula):
+        pieces.append(_CELL_REF.sub(replace, formula[cursor:quoted.start()]))
+        pieces.append(quoted.group(0))
+        cursor = quoted.end()
+    pieces.append(_CELL_REF.sub(replace, formula[cursor:]))
+    return "".join(pieces)
 
 
 def _shift_formula_columns(sheet: Worksheet, start_column: int, amount: int) -> None:
@@ -422,7 +436,7 @@ def _shift_formula_columns(sheet: Worksheet, start_column: int, amount: int) -> 
                     letters = get_column_letter(index + shift)
                 return f"{dollar_col}{letters}{dollar_row}{digits}"
 
-            cell.value = _CELL_REF.sub(replace, value)
+            cell.value = _rewrite_cell_refs(value, replace)
 
 
 def _retarget_formula(formula: str, source_row: int, target_row: int) -> str:
@@ -434,7 +448,7 @@ def _retarget_formula(formula: str, source_row: int, target_row: int) -> str:
             digits = str(target)
         return f"{dollar_col}{letters}{dollar_row}{digits}"
 
-    return _CELL_REF.sub(replace, formula)
+    return _rewrite_cell_refs(formula, replace)
 
 
 def _copied_formula(sheet: Worksheet, source_row: int | None, target_row: int, column: int) -> str:

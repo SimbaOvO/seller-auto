@@ -49,15 +49,23 @@ MATCHING_AD_INDEXES_SCRIPT = """
 """
 CARD_SCRIPT = """
 (root) => {
-  const images = [...root.querySelectorAll('img.poly-component__picture')];
+  const images = [...root.querySelectorAll('img.poly-component__picture, .poly-card__portada img')];
+  const productLink = (card, el) => {
+    const anchors = card ? [...card.querySelectorAll('a[href]')] : [];
+    const hrefs = anchors.map((anchor) => anchor.href || '');
+    const product = hrefs.find((href) => (
+      /mercadolibre\\./i.test(href)
+      && !/click1\\.mercadolibre|\\/mclics\\//i.test(href)
+      && /MLA/i.test(href)
+    ));
+    if (product) return product;
+    const direct = el.closest('a[href]');
+    if (direct && direct.href && direct.href.includes('mercadolibre.')) return direct.href;
+    return hrefs.find((href) => href.includes('mercadolibre.')) || '';
+  };
   return images.map((el) => {
     const card = el.closest('.poly-card, .ui-search-layout__item, .andes-card, li, .ui-recommendations-card');
-    const direct = el.closest('a[href]');
-    let href = direct ? direct.href : '';
-    if (!href && card) {
-      const link = card.querySelector('a[href]');
-      href = link ? link.href : '';
-    }
+    const href = productLink(card, el);
     let title = '';
     if (card) {
       const heading = card.querySelector('.poly-component__title');

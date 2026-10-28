@@ -12,6 +12,7 @@ from unittest import mock
 from seller_auto.browser_launch import (
     STEALTH_JS,
     chrome_for_testing_binary,
+    command_uses_profile,
     default_playwright_browsers_dir,
     desktop_chrome_user_agent,
     is_sandbox_browsers_path,
@@ -31,19 +32,16 @@ class BrowserLaunchTests(unittest.TestCase):
     def test_background_uses_full_chrome_without_automation_markers(self) -> None:
         profile = Path("/tmp/seller-auto-data/profile")
         options = persistent_context_options(profile, headless=True, chrome_version="156.0.8078.4")
-        self.assertTrue(options["headless"])
+        self.assertFalse(options["headless"])
         self.assertEqual(options["channel"], "chrome-for-testing")
-        self.assertEqual(options["user_agent"], desktop_chrome_user_agent("156.0.8078.4"))
-        self.assertNotIn("HeadlessChrome", options["user_agent"])
-        if sys.platform == "win32":
-            self.assertIn("Windows NT 10.0", options["user_agent"])
-        else:
-            self.assertIn("Macintosh", options["user_agent"])
-        self.assertNotIn("X11", options["user_agent"])
+        self.assertNotIn("user_agent", options)
+        self.assertNotIn("--headless", options["args"])
+        self.assertIn("--window-position=-32000,-32000", options["args"])
         self.assertIn("--enable-automation", options["ignore_default_args"])
         self.assertIn("--disable-blink-features=AutomationControlled", options["args"])
         self.assertEqual(options["locale"], "es-AR")
         self.assertNotIn("canvas", STEALTH_JS.lower())
+        self.assertNotIn("webgl", STEALTH_JS.lower())
         self.assertIn("webdriver", STEALTH_JS)
         self.assertIn("HeadlessChrome", STEALTH_JS)
 
@@ -54,8 +52,19 @@ class BrowserLaunchTests(unittest.TestCase):
             chrome_version="156.0.8078.4",
         )
         self.assertFalse(options["headless"])
-        self.assertNotIn("channel", options)
+        self.assertEqual(options["channel"], "chrome-for-testing")
         self.assertNotIn("user_agent", options)
+        self.assertNotIn("--window-position=-32000,-32000", options["args"])
+
+    def test_profile_match_ignores_the_enrich_browser(self) -> None:
+        profile = Path("E:/seller-auto/data/profile")
+        enrich = Path("E:/seller-auto/data/profile-enrich")
+        command = r"chrome.exe --user-data-dir=E:\seller-auto\data\profile --remote-debugging-pipe"
+        enrich_command = r"chrome.exe --user-data-dir=E:\seller-auto\data\profile-enrich --remote-debugging-pipe"
+        self.assertTrue(command_uses_profile(command, profile))
+        self.assertFalse(command_uses_profile(enrich_command, profile))
+        self.assertTrue(command_uses_profile(enrich_command, enrich))
+        self.assertFalse(command_uses_profile(command + " --type=renderer", profile))
 
     def test_read_chromium_version_from_plist(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -100,8 +109,24 @@ class BrowserLaunchTests(unittest.TestCase):
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"")
             completed = mock.Mock(stdout="Google Chrome for Testing 156.0.8078.4\n", stderr="")
-            with mock.patch("seller_auto.browser_launch.subprocess.run", return_value=completed):
+            with (
+                mock.patch("seller_auto.browser_launch._windows_file_version", return_value=None),
+                mock.patch("seller_auto.browser_launch.subprocess.run", return_value=completed),
+            ):
                 self.assertEqual(read_chromium_version(root), "156.0.8078.4")
+
+    def test_windows_file_version_does_not_launch_chrome(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "chromium-1300" / "chrome-win64" / "chrome.exe"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"")
+            with (
+                mock.patch("seller_auto.browser_launch._windows_file_version", return_value="156.0.8078.4"),
+                mock.patch("seller_auto.browser_launch.subprocess.run") as run,
+            ):
+                self.assertEqual(read_chromium_version(root), "156.0.8078.4")
+            run.assert_not_called()
 
     def test_newest_chromium_revision_wins(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

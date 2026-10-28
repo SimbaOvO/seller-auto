@@ -1,4 +1,4 @@
-"""后台启动完整 Chrome for Testing。去掉自动化标记，不改画布、WebGL 或操作系统。"""
+"""用 Playwright 启动完整 Chrome for Testing。不使用 headless，去掉 webdriver 标记。"""
 
 from __future__ import annotations
 
@@ -158,9 +158,20 @@ def read_chromium_version(browsers_dir: Path) -> str | None:
 
 
 def _version_from_binary(binary: Path) -> str | None:
+    """Windows 上直接读 exe 的版本资源。
+
+    再执行一次 chrome.exe --version 时，已经在跑的 Chrome 会把这次启动接走，
+    中文系统又按 GBK 解码输出。版本读不到，后台浏览器就继续带 HeadlessChrome。
+    """
+
+    version = _windows_file_version(binary)
+    if version:
+        return version
     kwargs: dict[str, Any] = {
         "capture_output": True,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
         "timeout": 15,
         "check": False,
     }
@@ -168,9 +179,53 @@ def _version_from_binary(binary: Path) -> str | None:
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     try:
         completed = subprocess.run([str(binary), "--version"], **kwargs)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
         return None
     match = _VERSION_RE.search(completed.stdout or completed.stderr or "")
+    return match.group(1) if match else None
+
+
+def _windows_file_version(binary: Path) -> str | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return None
+    version = ctypes.WinDLL("version", use_last_error=True)
+    version.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+    version.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+    version.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    version.GetFileVersionInfoW.restype = wintypes.BOOL
+    version.VerQueryValueW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.UINT),
+    ]
+    version.VerQueryValueW.restype = wintypes.BOOL
+    size = version.GetFileVersionInfoSizeW(str(binary), None)
+    if not size:
+        return None
+    buffer = ctypes.create_string_buffer(size)
+    if not version.GetFileVersionInfoW(str(binary), 0, size, buffer):
+        return None
+    pointer = ctypes.c_void_p()
+    length = wintypes.UINT()
+    if not version.VerQueryValueW(buffer, "\\VarFileInfo\\Translation", ctypes.byref(pointer), ctypes.byref(length)):
+        return None
+    if length.value < 4 or not pointer.value:
+        return None
+    lang, codepage = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint16 * 2)).contents
+    names = ("ProductVersion", "FileVersion")
+    text = ""
+    for name in names:
+        query = f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\{name}"
+        if version.VerQueryValueW(buffer, query, ctypes.byref(pointer), ctypes.byref(length)) and pointer.value:
+            text = ctypes.wstring_at(pointer)
+            break
+    match = _VERSION_RE.search(text)
     return match.group(1) if match else None
 
 
@@ -314,6 +369,188 @@ def mark_clean_shutdown(profile: Path) -> bool:
     return True
 
 
+def command_uses_profile(command: str, profile: Path) -> bool:
+    """浏览器进程的 user-data-dir 是否就是这个配置目录。"""
+
+    match = re.search(r'--user-data-dir=("?)([^"\s]+)\1', command or "")
+    if match is None or "--type=" in (command or ""):
+        return False
+    try:
+        return Path(match.group(2)).resolve() == profile.resolve()
+    except OSError:
+        return Path(match.group(2)) == profile
+
+
+def chrome_browser_commands() -> list[tuple[int, str]]:
+    """当前由 Playwright 拉起的 Chrome 主进程，不含渲染进程。"""
+
+    if sys.platform != "win32":
+        return []
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" | "
+        "Where-Object { $_.CommandLine -and ($_.CommandLine -notlike '*--type=*') } | "
+        "ForEach-Object { '{0}{1}{2}' -f $_.ProcessId, [char]31, $_.CommandLine }"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+            creationflags=flags,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    rows: list[tuple[int, str]] = []
+    for line in (completed.stdout or "").splitlines():
+        pid_text, separator, command = line.partition("\x1f")
+        if separator and pid_text.strip().isdigit():
+            rows.append((int(pid_text.strip()), command))
+    return rows
+
+
+def hide_chrome_windows(profile_dir: Path) -> None:
+    """把这个配置目录的窗口从桌面拿掉。浏览器进程仍留给 Playwright。"""
+
+    _set_chrome_windows(profile_dir, shown=False)
+
+
+def show_chrome_windows(profile_dir: Path) -> None:
+    _set_chrome_windows(profile_dir, shown=True)
+
+
+def _set_chrome_windows(profile_dir: Path, *, shown: bool) -> None:
+    if sys.platform != "win32":
+        return
+    pids = {pid for pid, command in chrome_browser_commands() if command_uses_profile(command, profile_dir)}
+    if not pids:
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+
+    windows: list[int] = []
+
+    def visit(hwnd: int, _lparam: int) -> bool:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in pids:
+            return True
+        name = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, name, 256)
+        if name.value != "Chrome_WidgetWin_1":
+            return True
+        windows.append(hwnd)
+        if shown:
+            _set_taskbar_style(user32, hwnd, visible=True)
+            user32.ShowWindow(hwnd, 9)
+            user32.SetWindowPos(hwnd, 0, 40, 40, 1440, 900, 0x0040)
+        else:
+            _set_taskbar_style(user32, hwnd, visible=False)
+            user32.ShowWindow(hwnd, 0)
+        return True
+
+    user32.EnumWindows(callback_type(visit), 0)
+    _taskbar_buttons(windows, shown=shown)
+
+
+def _set_taskbar_style(user32: Any, hwnd: int, *, visible: bool) -> None:
+    """工具窗口不进任务栏，和 macOS 上没有程序坞图标一样。"""
+
+    import ctypes
+    from ctypes import wintypes
+
+    getter = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+    setter = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+    getter.argtypes = [wintypes.HWND, ctypes.c_int]
+    getter.restype = ctypes.c_ssize_t
+    setter.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    setter.restype = ctypes.c_ssize_t
+    toolwindow = 0x00000080
+    appwindow = 0x00040000
+    style = int(getter(hwnd, -20))
+    if visible:
+        style = (style | appwindow) & ~toolwindow
+    else:
+        style = (style | toolwindow) & ~appwindow
+    setter(hwnd, -20, style)
+    user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0004 | 0x0010 | 0x0020)
+
+
+def _taskbar_buttons(hwnds: list[int], *, shown: bool) -> None:
+    if not hwnds:
+        return
+    import ctypes
+    import uuid
+    from ctypes import wintypes
+
+    class Guid(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", wintypes.BYTE * 8),
+        ]
+
+    def make_guid(value: str) -> Guid:
+        parsed = uuid.UUID(value)
+        return Guid(
+            parsed.time_low,
+            parsed.time_mid,
+            parsed.time_hi_version,
+            (wintypes.BYTE * 8).from_buffer_copy(parsed.bytes[8:]),
+        )
+
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+    ole32.CoInitialize.restype = ctypes.c_long
+    ole32.CoCreateInstance.argtypes = [
+        ctypes.POINTER(Guid),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(Guid),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ole32.CoCreateInstance.restype = ctypes.c_long
+    ole32.CoInitialize(None)
+    clsid = make_guid("{56FDF344-FD6D-11d0-958A-006097C9A090}")
+    iid = make_guid("{56FDF342-FD6D-11d0-958A-006097C9A090}")
+    pointer = ctypes.c_void_p()
+    if ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid), ctypes.byref(pointer)) < 0 or not pointer.value:
+        return
+    table = ctypes.cast(pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+    init = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(table[0][3])
+    change = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND)(table[0][4 if shown else 5])
+    if init(pointer) < 0:
+        return
+    for hwnd in hwnds:
+        change(pointer, hwnd)
+
+
 def persistent_context_options(
     profile_dir: Path,
     *,
@@ -324,11 +561,17 @@ def persistent_context_options(
     timezone_id: str = "America/Argentina/Buenos_Aires",
     geolocation: dict[str, float] | None = None,
 ) -> dict[str, Any]:
+    """交给 Playwright 启动有界面的 Chrome。headless 只表示窗口先放在屏幕外。"""
+
+    del chrome_version
     args = [item for item in LAUNCH_ARGS if not item.startswith("--lang=")]
     args.append(f"--lang={locale}")
-    options: dict[str, Any] = {
+    if headless:
+        args.append("--window-position=-32000,-32000")
+    return {
         "user_data_dir": str(profile_dir.resolve()),
-        "headless": headless,
+        "headless": False,
+        "channel": "chrome-for-testing",
         "locale": locale,
         "timezone_id": timezone_id,
         "geolocation": geolocation or {"latitude": -34.6037, "longitude": -58.3816},
@@ -338,9 +581,3 @@ def persistent_context_options(
         "ignore_default_args": ["--enable-automation"],
         "args": args,
     }
-    if headless:
-        # 不传 channel 时，Playwright 会改用精简的 headless shell。
-        options["channel"] = "chrome-for-testing"
-        if chrome_version:
-            options["user_agent"] = desktop_chrome_user_agent(chrome_version)
-    return options

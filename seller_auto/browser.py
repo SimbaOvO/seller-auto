@@ -9,10 +9,12 @@ from typing import Any, Callable
 
 from seller_auto.browser_launch import (
     STEALTH_JS,
+    hide_chrome_windows,
     mark_clean_shutdown,
     persistent_context_options,
     profile_is_busy,
     read_chromium_version,
+    show_chrome_windows,
     use_playwright_browsers,
 )
 from seller_auto.pacing import Cooldown, DelaySettings
@@ -35,6 +37,31 @@ def log(message: str) -> None:
     from seller_auto.step_log import step
 
     step("浏览器", message)
+
+
+def _move_window(page: Any, *, shown: bool) -> None:
+    """通过 Playwright 的调试协议移动窗口，不另开 Chrome。"""
+
+    try:
+        session = page.context.new_cdp_session(page)
+    except Exception:
+        log("没有拿到窗口会话")
+        return
+    bounds = (
+        {"left": 40, "top": 40, "width": 1440, "height": 900, "windowState": "normal"}
+        if shown
+        else {"left": -32000, "top": -32000, "width": 1440, "height": 900, "windowState": "normal"}
+    )
+    try:
+        info = session.send("Browser.getWindowForTarget")
+        session.send("Browser.setWindowBounds", {"windowId": info["windowId"], "bounds": bounds})
+    except Exception:
+        log("调整窗口位置失败")
+    finally:
+        try:
+            session.detach()
+        except Exception:
+            pass
 
 
 def context_is_alive(context: Any) -> bool:
@@ -134,6 +161,7 @@ class ArgentinaBrowser:
         self.trim_tabs()
         self._configure(self.list_page)
         if self.headless:
+            self._keep_background()
             log("已在后台启动完整 Chrome，没有打开窗口。")
         else:
             log("已打开前台窗口。")
@@ -216,14 +244,21 @@ class ArgentinaBrowser:
 
     def needs_verification(self, page: Any) -> bool:
         try:
+            if page.locator("img.poly-component__picture, .poly-card__portada img").count() >= 4:
+                return False
+        except Exception:
+            pass
+        try:
             url = page.url or ""
         except Exception:
             return False
         if looks_like_verification_url(url):
+            log(f"页面地址像验证页：{url}")
             return True
         for selector in VERIFICATION_SELECTORS:
             try:
                 if page.locator(selector).count() > 0:
+                    log(f"页面里有验证控件：{selector}")
                     return True
             except Exception:
                 continue
@@ -233,7 +268,10 @@ class ArgentinaBrowser:
             )
         except Exception:
             snippet = ""
-        return text_looks_blocked(snippet)
+        if text_looks_blocked(snippet):
+            log("页面文字像验证页")
+            return True
+        return False
 
     def ensure_clear(self, page: Any, site: str) -> dict[str, Any] | None:
         if not self.needs_verification(page):
@@ -288,6 +326,7 @@ class ArgentinaBrowser:
             page.wait_for_load_state("domcontentloaded", timeout=timeout or 45000)
         except PlaywrightTimeout:
             log("页面已离开空白页，正文仍在加载")
+        self._keep_background()
 
     def open_detail(
         self,
@@ -303,11 +342,13 @@ class ArgentinaBrowser:
         if viewport is not None:
             page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
         self.trim_tabs()
+        self._keep_background()
         try:
             self.goto(page, url, timeout=timeout)
         except Exception:
             self.close_detail()
             raise
+        self._keep_background()
         return page
 
     def click_result(self, locator: Any) -> tuple[Any, bool]:
@@ -330,12 +371,14 @@ class ArgentinaBrowser:
                 page.wait_for_load_state("domcontentloaded", timeout=20000)
             except PlaywrightTimeout:
                 pass
+            self._keep_background()
             return page, True
         try:
             self.list_page.wait_for_load_state("domcontentloaded", timeout=20000)
         except PlaywrightTimeout:
             pass
         self.trim_tabs()
+        self._keep_background()
         return self.list_page, False
 
     def finish_detail(self, opened_new_tab: bool, list_url: str | None = None) -> None:
@@ -351,6 +394,7 @@ class ArgentinaBrowser:
             if self.list_page.url != list_url:
                 self.goto(self.list_page, list_url)
         self.trim_tabs()
+        self._keep_background()
 
     def live_page(self, page: Any) -> Any:
         try:
@@ -366,67 +410,52 @@ class ArgentinaBrowser:
                 pass
         return self.list_page
 
-    def _page_url(self, page: Any) -> str:
-        try:
-            return page.url or ""
-        except Exception:
-            return ""
-
     def _show_for_verification(self, page: Any) -> Any:
         if not self.headless:
             return page
-        detail = page is self.detail_page and page is not self.list_page
-        urls = self._urls_to_restore(page, detail)
         log("需要手动验证，暂时打开前台窗口")
-        self._reopen(headless=False, urls=urls, restore_detail=detail)
-        return self.detail_page if detail and self.detail_page is not None else self.list_page
+        self.headless = False
+        self._bring_forward(page)
+        return page
 
     def reveal(self, page: Any, reason: str) -> Any:
-        """需要登录时把当前页放到前台，返回重新打开后的页面。"""
+        """需要登录时把当前页放到前台，返回同一个页面。"""
 
         if not self.headless:
             return page
-        detail = page is self.detail_page and page is not self.list_page
-        urls = self._urls_to_restore(page, detail)
         log(reason)
-        self._reopen(headless=False, urls=urls, restore_detail=detail)
-        shown = self.detail_page if detail and self.detail_page is not None else self.list_page
-        return shown or page
+        self.headless = False
+        self._bring_forward(page)
+        return page
 
     def restore_background(self, page: Any) -> Any:
         if not self.background or self.headless:
             return page
-        detail = page is self.detail_page and page is not self.list_page
         self._return_to_background(page, "登录已完成，浏览器回到后台")
-        shown = self.detail_page if detail and self.detail_page is not None else self.list_page
-        return shown or page
+        return page
 
     def _return_to_background(self, page: Any, message: str = "验证已通过，浏览器回到后台") -> None:
         if not self.background or self.headless:
             return
-        detail = page is self.detail_page and page is not self.list_page
-        urls = self._urls_to_restore(page, detail)
         log(message)
-        self._reopen(headless=True, urls=urls, restore_detail=detail)
+        self.headless = True
+        self._keep_background()
 
-    def _urls_to_restore(self, page: Any, detail: bool) -> list[str]:
-        current = self._page_url(page)
-        list_url = self._page_url(self.list_page)
-        if detail:
-            return [url for url in (list_url, current) if url and not url.startswith("about:")]
-        if current and not current.startswith("about:"):
-            return [current]
-        return []
-
-    def _reopen(self, *, headless: bool, urls: list[str], restore_detail: bool) -> None:
-        self.headless = headless
-        self.close()
-        self.start()
-        if not urls:
+    def _keep_background(self) -> None:
+        if not self.headless:
             return
-        self.goto(self.list_page, urls[0])
-        if restore_detail and len(urls) > 1:
-            self.open_detail(urls[1])
+        page = self.list_page if self.list_page is not None else self.detail_page
+        if page is not None:
+            _move_window(page, shown=False)
+        hide_chrome_windows(self.profile_dir)
+
+    def _bring_forward(self, page: Any) -> None:
+        show_chrome_windows(self.profile_dir)
+        _move_window(page, shown=True)
+        try:
+            page.bring_to_front()
+        except Exception:
+            log("把窗口放到前台失败")
 
     def download_bytes(self, url: str, referer: str) -> bytes:
         response = self.context.request.get(
