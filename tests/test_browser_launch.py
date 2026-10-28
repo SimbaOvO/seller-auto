@@ -16,6 +16,7 @@ from seller_auto.browser_launch import (
     playwright_browsers_dir,
     profile_is_busy,
     read_chromium_version,
+    snapshot_profile,
     use_playwright_browsers,
 )
 from seller_auto.pacing import DelaySettings
@@ -73,6 +74,21 @@ class BrowserLaunchTests(unittest.TestCase):
             saved = json.loads(prefs.read_text(encoding="utf-8"))
             self.assertEqual(saved["profile"]["exit_type"], "Normal")
             self.assertFalse(mark_clean_shutdown(Path(directory)))
+
+    def test_snapshot_keeps_login_and_drops_the_process_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "profile-enrich"
+            cookies = source / "Default" / "Cookies"
+            cache = source / "Default" / "Cache" / "data_0"
+            cookies.parent.mkdir(parents=True)
+            cache.parent.mkdir()
+            cookies.write_bytes(b"cookie")
+            cache.write_bytes(b"cache")
+            (source / "SingletonLock").symlink_to(f"host-{os.getpid()}")
+            destination = snapshot_profile(source, Path(directory) / "profile-enrich-backfill")
+            self.assertEqual((destination / "Default" / "Cookies").read_bytes(), b"cookie")
+            self.assertFalse((destination / "SingletonLock").exists())
+            self.assertFalse((destination / "Default" / "Cache").exists())
 
 
 class PlaywrightBrowsersPathTests(unittest.TestCase):

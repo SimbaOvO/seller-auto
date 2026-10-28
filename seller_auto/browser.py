@@ -37,6 +37,37 @@ def log(message: str) -> None:
     step("浏览器", message)
 
 
+def context_is_alive(context: Any) -> bool:
+    """持久化上下文的 browser 是空的，pages 又只是本地缓存，所以要打一次协议。"""
+
+    if context is None:
+        return False
+    try:
+        browser = getattr(context, "browser", None)
+        if browser is not None and hasattr(browser, "is_connected") and not browser.is_connected():
+            return False
+        context.cookies()
+        return True
+    except Exception:
+        return False
+
+
+def browser_closed_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "has been closed",
+            "target closed",
+            "browser has been closed",
+            "context has been closed",
+            "processsingleton",
+            "profile is already in use",
+            "profile appears to be in use",
+        )
+    )
+
+
 class ArgentinaBrowser:
     def __init__(
         self,
@@ -67,7 +98,10 @@ class ArgentinaBrowser:
 
     def start(self) -> None:
         if self.context is not None:
-            return
+            if context_is_alive(self.context):
+                return
+            log("浏览器已断开，重新打开")
+            self._abandon()
         from playwright.sync_api import sync_playwright
 
         self._wait_until_profile_free()
@@ -108,15 +142,26 @@ class ArgentinaBrowser:
         while profile_is_busy(self.profile_dir) and time.monotonic() < deadline:
             time.sleep(0.2)
 
-    def close(self) -> None:
-        if self.context is not None:
-            self.context.close()
-            self.context = None
-        if self._playwright is not None:
-            self._playwright.stop()
-            self._playwright = None
+    def _abandon(self) -> None:
+        context = self.context
+        playwright = self._playwright
+        self.context = None
+        self._playwright = None
         self.list_page = None
         self.detail_page = None
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self._abandon()
 
     def _configure(self, page: Any) -> None:
         page.set_default_timeout(15000)

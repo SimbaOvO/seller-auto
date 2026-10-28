@@ -21,7 +21,7 @@ from seller_auto.amazon import (
     read_product,
     title_locator,
 )
-from seller_auto.browser import NEEDS_HUMAN, ArgentinaBrowser, log
+from seller_auto.browser import NEEDS_HUMAN, ArgentinaBrowser, browser_closed_error, log
 from seller_auto.categories import category_reason, classify_breadcrumb
 from seller_auto.images import save_original, to_client_jpeg
 from seller_auto.lingdong import apply_last_mile, collect_market_quotes, quote_links
@@ -888,11 +888,22 @@ class SellerAutoService:
             return "蓝鲸选品没有查成，单量这次没写。"
 
     def _run_market_quotes(self, jobs: list[dict[str, Any]]) -> str:
-        browser = self._ensure_enrich_browser()
-        quotes = collect_market_quotes(
-            browser,
-            [(job["links"], job.get("package")) for job in jobs],
-        )
+        try:
+            browser = self._ensure_enrich_browser()
+            quotes = collect_market_quotes(
+                browser,
+                [(job["links"], job.get("package")) for job in jobs],
+            )
+        except Exception as exc:
+            if not browser_closed_error(exc):
+                raise
+            step("蓝鲸", "资料浏览器已断开，重开后再查")
+            self._reset_enrich_browser()
+            browser = self._ensure_enrich_browser()
+            quotes = collect_market_quotes(
+                browser,
+                [(job["links"], job.get("package")) for job in jobs],
+            )
         wrote = False
         state = self._require_state()
         for job, quote in zip(jobs, quotes):
@@ -919,19 +930,59 @@ class SellerAutoService:
                 timezone_id="Asia/Shanghai",
                 geolocation={"latitude": 31.2304, "longitude": 121.4737},
             )
-        self.enrich_browser.start()
+        try:
+            self.enrich_browser.start()
+        except Exception as exc:
+            if not browser_closed_error(exc):
+                raise
+            step("资料", "资料浏览器启动失败，丢掉后重开")
+            self._reset_enrich_browser()
+            if self.enrich_browser is None:
+                enrich_dir = Path(str(self.profile_dir) + "-enrich")
+                self.enrich_browser = ArgentinaBrowser(
+                    self.settings,
+                    enrich_dir,
+                    headless=self.headless,
+                    locale="zh-CN",
+                    accept_language="zh-CN,zh;q=0.9",
+                    timezone_id="Asia/Shanghai",
+                    geolocation={"latitude": 31.2304, "longitude": 121.4737},
+                )
+            self.enrich_browser.start()
         assert self.enrich_browser is not None
         return self.enrich_browser
+
+    def _reset_enrich_browser(self) -> None:
+        current = self.enrich_browser
+        if current is None:
+            return
+        try:
+            current.close()
+        except Exception:
+            log("关闭资料查询浏览器失败")
+        self.enrich_browser = None
+
+    def _enrich_once(self, product_id: str) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+        browser = self._ensure_enrich_browser()
+        package, page = self._open_competitor(browser, product_id)
+        source = None
+        if page is not None:
+            source = self._read_1688_from_row(browser, page, product_id)
+        return package, source
 
     def _run_enrichment(self, product_id: str, image_url: str, event: threading.Event) -> None:
         _ = image_url
         package = None
         source = None
         try:
-            browser = self._ensure_enrich_browser()
-            package, page = self._open_competitor(browser, product_id)
-            if page is not None:
-                source = self._read_1688_from_row(browser, page, product_id)
+            try:
+                package, source = self._enrich_once(product_id)
+            except Exception as exc:
+                if not browser_closed_error(exc):
+                    raise
+                step("资料", f"{product_id} 资料浏览器已断开，重开后再查")
+                self._reset_enrich_browser()
+                package, source = self._enrich_once(product_id)
             with self._state_lock:
                 if self.state and product_id in self.state.get("products", {}):
                     self.state["products"][product_id]["package_size"] = package
@@ -961,6 +1012,8 @@ class SellerAutoService:
         try:
             return open_competitor(browser, asin)
         except Exception as exc:
+            if browser_closed_error(exc):
+                raise
             step("卖家精灵", f"没有读到包装尺寸：{exc}")
             log(traceback.format_exc())
             return None, None
@@ -972,6 +1025,8 @@ class SellerAutoService:
                 return None
             return read_page_source(browser, opened)
         except Exception as exc:
+            if browser_closed_error(exc):
+                raise
             step("1688", f"没有读到货源均价：{exc}")
             log(traceback.format_exc())
             return None
@@ -980,6 +1035,8 @@ class SellerAutoService:
         try:
             return read_package_size(browser, asin)
         except Exception as exc:
+            if browser_closed_error(exc):
+                raise
             step("卖家精灵", f"没有读到包装尺寸：{exc}")
             log(traceback.format_exc())
             try:

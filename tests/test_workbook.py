@@ -12,6 +12,7 @@ from seller_auto.workbook import (
     TEMPLATE_SHEET,
     can_enter_top,
     dimension_cm,
+    fill_package_rows,
     lowest_selling_price,
     ranked_matches,
     sales_cutoff,
@@ -272,6 +273,33 @@ class WorkbookTests(unittest.TestCase):
             sheet = load_workbook(path)[TEMPLATE_SHEET]
             self.assertEqual(sheet.cell(3, _column(sheet, "名称")).value, "硅胶灶台缝隙盖")
             self.assertIsNone(sheet.cell(4, 1).value)
+
+    def test_fill_package_rows_updates_the_matching_sku(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.xlsx"
+            _mini_workbook(path)
+            empty = _product()
+            empty["package_size"] = None
+            empty["source_price"] = None
+            write_product_workbook(path, [empty])
+            filled = _product()
+            filled["fba_fee"] = 1390
+            filled["market_orders"] = 12
+            self.assertEqual(fill_package_rows(path, [filled]), 1)
+            sheet = load_workbook(path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(3, _column(sheet, "毛重")).value, 0.204)
+            self.assertEqual(sheet.cell(3, _column(sheet, "长")).value, 11.2)
+            self.assertEqual(sheet.cell(3, _column(sheet, "宽")).value, 9.7)
+            self.assertEqual(sheet.cell(3, _column(sheet, "高")).value, 6.1)
+            self.assertEqual(sheet.cell(3, _column(sheet, "采购成本")).value, 12.35)
+            self.assertEqual(sheet.cell(3, _column(sheet, "FBA")).value, 1390)
+            self.assertEqual(sheet.cell(3, _column(sheet, "名称")).value, "硅胶灶台缝隙盖\n（12单）")
+            self.assertEqual(sheet.cell(2, 1).value, "已有产品")
+            later = _product()
+            later["market_orders"] = 99
+            self.assertEqual(fill_package_rows(path, [later]), 0)
+            sheet = load_workbook(path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(3, _column(sheet, "名称")).value, "硅胶灶台缝隙盖\n（12单）")
 
     def test_template_file_is_still_the_working_sheet(self) -> None:
         self.assertEqual(template_path().name, "test.xlsx")

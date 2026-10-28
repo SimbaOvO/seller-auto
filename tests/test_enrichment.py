@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from seller_auto.pacing import DelaySettings
 from seller_auto.service import SellerAutoService, _new_state
@@ -118,6 +119,66 @@ class EnrichmentTests(unittest.TestCase):
             product = service.state["products"]["B07LCLQ47D"]
             self.assertEqual(product["package_size"]["weight"], "260")
             self.assertEqual(product["source_price"]["average"], "8.00")
+
+    def test_closed_browser_is_reopened_and_queried_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            service.state = _product_state()
+            calls = {"open": 0}
+
+            def fake_open(browser: object, asin: str) -> tuple[dict[str, str], str]:
+                calls["open"] += 1
+                if calls["open"] == 1:
+                    raise RuntimeError("BrowserContext.add_cookies: Target page, context or browser has been closed")
+                return {"weight": "260", "weight_unit": "g", "length": "10", "width": "8", "height": "6", "unit": "cm"}, "lookup"
+
+            service._ensure_enrich_browser = lambda: object()
+            service._reset_enrich_browser = lambda: None
+            service._open_competitor = fake_open
+            service._read_1688_from_row = lambda browser, page, asin: {"average": "8.00"}
+            event = threading.Event()
+            service._run_enrichment("B07LCLQ47D", "https://example.com/img.jpg", event)
+            self.assertTrue(event.is_set())
+            self.assertEqual(calls["open"], 2)
+            product = service.state["products"]["B07LCLQ47D"]
+            self.assertEqual(product["package_size"]["length"], "10")
+            self.assertEqual(product["source_price"]["average"], "8.00")
+
+    def test_closed_browser_during_source_lookup_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            service.state = _product_state()
+            calls = {"open": 0, "source": 0}
+
+            def fake_open(browser: object, asin: str) -> tuple[dict[str, str], str]:
+                calls["open"] += 1
+                return {"weight": "260", "weight_unit": "g", "length": "10", "width": "8", "height": "6", "unit": "cm"}, "lookup"
+
+            def fake_source(browser: object, page: object, asin: str) -> dict[str, str]:
+                calls["source"] += 1
+                if calls["source"] == 1:
+                    raise RuntimeError("BrowserContext.new_page: Target page, context or browser has been closed")
+                return {"average": "8.00"}
+
+            service._ensure_enrich_browser = lambda: object()
+            service._reset_enrich_browser = lambda: None
+            service._open_competitor = fake_open
+            service._read_1688_from_row = fake_source
+            event = threading.Event()
+            service._run_enrichment("B07LCLQ47D", "https://example.com/img.jpg", event)
+            self.assertEqual(calls["open"], 2)
+            self.assertEqual(calls["source"], 2)
+            self.assertEqual(service.state["products"]["B07LCLQ47D"]["source_price"]["average"], "8.00")
+
+    def test_closed_source_error_is_not_recorded_as_missing_price(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            with mock.patch(
+                "seller_auto.service.open_1688_from_row",
+                side_effect=RuntimeError("Target page, context or browser has been closed"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    service._read_1688_from_row(object(), object(), "B07LCLQ47D")
 
 
 if __name__ == "__main__":

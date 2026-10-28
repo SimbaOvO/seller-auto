@@ -14,14 +14,25 @@ LOGIN_URL = "https://www.sellersprite.com/cn/w/user/login"
 LOOKUP_VIEWPORT = (2048, 1200)
 LOOKUP_TIMEOUT_MS = 45000
 _ASIN_RE = re.compile(r"^B0[A-Z0-9]{8}$")
+_LABEL = r"(?:profundidad|longitud|ancho|alto|largo|prof\.?|alt\.?|an\.?|l\.?)"
+_UNIT_WORD = r"(?:centimeters?|centimetres?|pulgadas?|pulgada|inches|inch|cm|in|厘米|英寸)"
+_GAP = rf"(?:\s*{_LABEL})?\s*(?:{_UNIT_WORD})?(?:\s+de\s+{_LABEL})?"
+_SEP = r"[x×*＊✕✖ｘ]"
 _DIMENSION_RE = re.compile(
-    r"(\d+(?:[.,]\d+)?)\s*(?:cm|in|inches|厘米|英寸)?\s*[x×*＊✕✖ｘ]\s*"
-    r"(\d+(?:[.,]\d+)?)\s*(?:cm|in|inches|厘米|英寸)?\s*[x×*＊✕✖ｘ]\s*"
-    r"(\d+(?:[.,]\d+)?)\s*(cm|in|inches|厘米|英寸)?",
+    rf"(\d+(?:[.,]\d+)?){_GAP}\s*{_SEP}\s*"
+    rf"(\d+(?:[.,]\d+)?){_GAP}\s*{_SEP}\s*"
+    rf"(\d+(?:[.,]\d+)?)(?:\s*{_LABEL})?\s*({_UNIT_WORD})?(?:\s+de\s+{_LABEL})?",
+    re.IGNORECASE,
+)
+_DIMENSION_2D_RE = re.compile(
+    rf"(\d+(?:[.,]\d+)?){_GAP}\s*{_SEP}\s*"
+    rf"(\d+(?:[.,]\d+)?)(?:\s*{_LABEL})?\s*({_UNIT_WORD})?(?:\s+de\s+{_LABEL})?",
     re.IGNORECASE,
 )
 _WEIGHT_RE = re.compile(
-    r"(\d+(?:[.,]\d+)?)\s*(kg|g|lb|lbs|oz|千克|公斤|克|磅|盎司)(?!\w)",
+    r"(\d+(?:[.,]\d+)?)\s*"
+    r"(kilograms?|kilos?|grams?|gramos?|pounds?|libras?|ounces?|onzas?|kg|g|lb|lbs|oz|千克|公斤|克|磅|盎司)"
+    r"(?!\w)",
     re.IGNORECASE,
 )
 _WEIGHT_UNITS = {
@@ -35,10 +46,27 @@ _WEIGHT_UNITS = {
     "磅": "lb",
     "oz": "oz",
     "盎司": "oz",
+    "kilogram": "kg",
+    "kilograms": "kg",
+    "kilo": "kg",
+    "kilos": "kg",
+    "gram": "g",
+    "grams": "g",
+    "gramo": "g",
+    "gramos": "g",
+    "pound": "lb",
+    "pounds": "lb",
+    "libra": "lb",
+    "libras": "lb",
+    "ounce": "oz",
+    "ounces": "oz",
+    "onza": "oz",
+    "onzas": "oz",
 }
 
 # 同时认「包装重量 / 包装尺寸」和「商品重量 / 商品尺寸」。
-# 包装列能解析出重量或尺寸就用包装列；包装列没有，再用商品列。两列都没有就留空。
+# 包装列两项都有就只用包装列。包装列只有重量或只有尺寸时，用商品列补上缺的那一项。
+# 两列都没有重量和尺寸就留空。
 LOOKUP_STATE_JS = r"""
 (asin) => {
   const markers = [
@@ -74,8 +102,8 @@ LOOKUP_STATE_JS = r"""
     return hints.some((hint) => body.includes(hint));
   };
   const score = (text) => {
-    const size = /\d+(?:[.,]\d+)?\s*(?:cm|in|inches|厘米|英寸)?\s*[x×*＊✕✖ｘ]\s*\d+/i.test(text);
-    const weight = /\d+(?:[.,]\d+)?\s*(?:kg|g|lb|lbs|oz|千克|公斤|克|磅|盎司)/i.test(text);
+    const size = /\d+(?:[.,]\d+)?\s*(?:prof\.?|alt\.?|an\.?|l\.?|profundidad|ancho|alto|largo)?\s*(?:cm|in|inches|厘米|英寸|centimeters?|pulgadas?)?\s*[x×*＊✕✖ｘ]\s*\d+/i.test(text);
+    const weight = /\d+(?:[.,]\d+)?\s*(?:kilograms?|kilos?|grams?|gramos?|pounds?|libras?|ounces?|onzas?|kg|g|lb|lbs|oz|千克|公斤|克|磅|盎司)(?!\w)/i.test(text);
     return (size ? 2 : 0) + (weight ? 1 : 0);
   };
   const readText = (el) => {
@@ -135,8 +163,19 @@ LOOKUP_STATE_JS = r"""
         });
       }
     }
-    if (packageBest && packageBest.score > 0) return {found: true, rows: true, text: packageBest.text};
-    if (productBest && productBest.score > 0) return {found: true, rows: true, text: productBest.text};
+    const pkg = packageBest && packageBest.score > 0 ? packageBest.text : "";
+    const prod = productBest && productBest.score > 0 ? productBest.text : "";
+    const mergeText = () => {
+      if (!pkg) return prod;
+      if (!prod) return pkg;
+      const pkgSize = packageBest.score >= 2;
+      const pkgWeight = packageBest.score % 2 === 1;
+      if (pkgSize && pkgWeight) return pkg;
+      if (!pkgSize && productBest.score >= 2) return pkg + "\n" + prod;
+      if (!pkgWeight && productBest.score % 2 === 1) return pkg + "\n" + prod;
+      return pkg;
+    };
+    if (pkg || prod) return {found: true, rows: true, text: mergeText()};
     if (packageBest || productBest) return {found: true, rows: true, text: ""};
     return {found: headerOnly, rows: false, text: ""};
   };
@@ -180,20 +219,31 @@ def _plain_number(raw: str) -> str:
     return raw.replace(",", ".")
 
 
+def _normalized_unit(raw: str) -> str:
+    unit = (raw or "").lower()
+    if unit in {"in", "inch", "inches", "英寸", "pulgada", "pulgadas"}:
+        return "in"
+    if unit in {"cm", "厘米", "centimeter", "centimeters", "centimetre", "centimetres"}:
+        return "cm"
+    return unit
+
+
 def parse_package_dimensions(text: str) -> dict[str, str] | None:
-    match = _DIMENSION_RE.search((text or "").replace("\u00a0", " "))
+    cleaned = (text or "").replace("\u00a0", " ")
+    match = _DIMENSION_RE.search(cleaned)
+    height = True
+    if match is None:
+        match = _DIMENSION_2D_RE.search(cleaned)
+        height = False
     if match is None:
         return None
-    unit = (match.group(4) or "").lower()
-    if unit in {"in", "inches", "英寸"}:
-        unit = "in"
-    elif unit in {"cm", "厘米"}:
-        unit = "cm"
     parsed = {
         "length": _plain_number(match.group(1)),
         "width": _plain_number(match.group(2)),
-        "height": _plain_number(match.group(3)),
     }
+    if height:
+        parsed["height"] = _plain_number(match.group(3))
+    unit = _normalized_unit(match.group(4) if height else match.group(3))
     if unit:
         parsed["unit"] = unit
     return parsed
@@ -302,7 +352,10 @@ def open_competitor(browser: Any, asin: str) -> tuple[dict[str, str] | None, Any
         parts.append(f"{parsed['weight']} {parsed['weight_unit']}")
     if "length" in parsed:
         unit = parsed.get("unit") or ""
-        parts.append(f"{parsed['length']} x {parsed['width']} x {parsed['height']} {unit}".rstrip())
+        dims = [parsed["length"], parsed["width"]]
+        if parsed.get("height"):
+            dims.append(parsed["height"])
+        parts.append((" x ".join(dims) + (f" {unit}" if unit else "")).rstrip())
     step("卖家精灵", "已记录包装 " + "，".join(parts))
     return parsed, page
 
@@ -386,16 +439,25 @@ def open_1688_from_row(browser: Any, page: Any, asin: str) -> Any | None:
 
 
 def _use_chinese(browser: Any) -> None:
+    from seller_auto.browser import browser_closed_error
+
+    cookies = [
+        {
+            "name": "ecookie",
+            "value": "cn",
+            "url": "https://www.sellersprite.com/",
+        }
+    ]
     browser.start()
-    browser.context.add_cookies(
-        [
-            {
-                "name": "ecookie",
-                "value": "cn",
-                "url": "https://www.sellersprite.com/",
-            }
-        ]
-    )
+    try:
+        browser.context.add_cookies(cookies)
+    except Exception as exc:
+        if not browser_closed_error(exc):
+            raise
+        step("卖家精灵", "资料浏览器已断开，重新打开后再设中文")
+        browser.close()
+        browser.start()
+        browser.context.add_cookies(cookies)
 
 
 def _wait_state(page: Any, asin: str) -> dict[str, str]:

@@ -17,7 +17,7 @@ from seller_auto.service import ToolPayload
 ROOT = Path(__file__).resolve().parent.parent
 SOCKET_PATH = ROOT / "data" / "seller-auto.sock"
 PID_PATH = ROOT / "data" / "seller-auto.pid"
-CODE_REVISION = "mcp-submit-nowait"
+CODE_REVISION = "enrich-browser-recover"
 
 
 def encode_message(payload: dict) -> bytes:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +114,49 @@ def profile_is_busy(profile: Path) -> bool:
     except OSError:
         return False
     return True
+
+
+def _skip_profile_entry(name: str) -> bool:
+    if name.startswith("Singleton"):
+        return True
+    return name in {
+        "Cache",
+        "Code Cache",
+        "GPUCache",
+        "GrShaderCache",
+        "GraphiteDawnCache",
+        "DawnGraphiteCache",
+        "DawnWebGPUCache",
+        "Service Worker",
+        "Crashpad",
+        "BrowserMetrics",
+        "ShaderCache",
+    }
+
+
+def snapshot_profile(source: Path, destination: Path) -> Path:
+    """复制登录态到另一个目录。不带进程锁，第二只 Chrome 就不会关掉正在用的那只。"""
+
+    if source.resolve() == destination.resolve():
+        return destination
+    if destination.exists():
+        shutil.rmtree(destination, ignore_errors=True)
+    destination.mkdir(parents=True, exist_ok=True)
+    if not source.is_dir():
+        return destination
+    for dirpath, dirnames, filenames in os.walk(source):
+        relative = Path(dirpath).relative_to(source)
+        dirnames[:] = [name for name in dirnames if not _skip_profile_entry(name)]
+        target_dir = destination / relative
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for name in filenames:
+            if _skip_profile_entry(name):
+                continue
+            try:
+                shutil.copy2(Path(dirpath) / name, target_dir / name)
+            except OSError:
+                continue
+    return destination
 
 
 def mark_clean_shutdown(profile: Path) -> bool:

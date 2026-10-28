@@ -182,6 +182,92 @@ def lowest_selling_price(matches: list[dict[str, Any]]) -> float | None:
     return float(min(prices).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
+def _name_key(value: Any) -> str:
+    return str(value or "").split("\n", 1)[0].strip()
+
+
+def _find_product_row(sheet: Worksheet, roles: dict[str, int], product: dict[str, Any]) -> int | None:
+    sku = (product.get("keywords") or "").strip()
+    name = (product.get("chinese_name") or "").strip()
+    sku_column = roles.get("sku")
+    name_column = roles.get("name")
+    last = _next_data_row(sheet)
+    hits: list[int] = []
+    for row in range(2, last):
+        cell_sku = str(sheet.cell(row, sku_column).value or "").strip() if sku_column else ""
+        cell_name = _name_key(sheet.cell(row, name_column).value) if name_column else ""
+        if sku and cell_sku == sku:
+            hits.append(row)
+        elif name and cell_name == name:
+            hits.append(row)
+    return hits[-1] if hits else None
+
+
+def _fill_package_cells(
+    sheet: Worksheet,
+    row: int,
+    roles: dict[str, int],
+    product: dict[str, Any],
+    *,
+    replace_fba: bool = False,
+) -> bool:
+    package = product.get("package_size") or {}
+    values: dict[str, Any] = {
+        "weight": weight_kg(package),
+        "length": dimension_cm(package, "length"),
+        "width": dimension_cm(package, "width"),
+        "height": dimension_cm(package, "height"),
+        "cost": purchase_cost(product),
+        "fba": fba_amount(product.get("fba_fee")),
+        "expected_qty": order_count(product),
+    }
+    changed = False
+    for role, value in values.items():
+        column = roles.get(role)
+        if not column or value in (None, ""):
+            continue
+        current = sheet.cell(row, column).value
+        if current in (None, ""):
+            sheet.cell(row, column, value)
+            changed = True
+        elif replace_fba and role == "fba" and current != value:
+            sheet.cell(row, column, value)
+            changed = True
+    name_column = roles.get("name")
+    if name_column and order_count(product) is not None:
+        wanted = display_name(product)
+        current = sheet.cell(row, name_column).value
+        current_text = str(current or "")
+        if wanted and wanted != current and "单" not in current_text:
+            sheet.cell(row, name_column, wanted)
+            changed = True
+    return changed
+
+
+def fill_package_rows(path: Path, products: list[dict[str, Any]], *, replace_fba: bool = False) -> int:
+    """按 SKU 回填已有行的毛重、长宽高、采购成本和 FBA，不另加行。"""
+
+    rows = [product for product in products if (product.get("keywords") or product.get("chinese_name"))]
+    if not rows or not path.is_file():
+        return 0
+    workbook = load_workbook(path)
+    sheet = workbook[TEMPLATE_SHEET]
+    headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    roles = _roles(headers)
+    updated = 0
+    for product in rows:
+        row = _find_product_row(sheet, roles, product)
+        if row is None:
+            continue
+        if _fill_package_cells(sheet, row, roles, product, replace_fba=replace_fba):
+            updated += 1
+    if updated:
+        if not os.access(path, os.W_OK):
+            path.chmod(path.stat().st_mode | 0o200)
+        workbook.save(path)
+    return updated
+
+
 def write_product_workbook(path: Path, products: list[dict[str, Any]], template: Path | None = None) -> int:
     rows = [product for product in products if ranked_matches(product, limit=1)]
     if not rows:
