@@ -1,3 +1,4 @@
+import ctypes
 import importlib.util
 import unittest
 from pathlib import Path
@@ -37,6 +38,28 @@ class LaunchMcpTests(unittest.TestCase):
             ["/tmp/venv/bin/python", "-m", "seller_auto.mcp_server"],
         )
         wait.assert_not_called()
+
+    def test_windows_child_starts_without_a_console(self) -> None:
+        process = mock.Mock()
+        process.wait.return_value = 0
+        process._handle = 42
+        kernel = mock.Mock()
+        kernel.AssignProcessToJobObject.return_value = 0
+        flags = getattr(launch_mcp.subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        with (
+            mock.patch.object(launch_mcp, "_windows_kill_on_close_job", return_value=7),
+            mock.patch.object(launch_mcp.subprocess, "Popen", return_value=process) as opened,
+            mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel),
+            mock.patch.object(ctypes, "get_last_error", create=True, return_value=5),
+            mock.patch.object(launch_mcp.sys, "stderr") as stderr,
+        ):
+            code = launch_mcp._wait_on_windows(
+                [r"E:\seller-auto\.venv\Scripts\python.exe", "-m", "seller_auto.mcp_server"]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(opened.call_args.kwargs["creationflags"], flags)
+        self.assertIn("5", stderr.write.call_args.args[0])
+        kernel.CloseHandle.assert_called_once_with(7)
 
 
 if __name__ == "__main__":

@@ -47,14 +47,20 @@ def _wait_on_windows(argv: list[str]) -> int:
     import ctypes
 
     job = _windows_kill_on_close_job()
-    process = subprocess.Popen(argv)
+    # 标准输入输出继续继承。CREATE_NO_WINDOW 避免再弹出一个控制台。
+    process = subprocess.Popen(
+        argv,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+    )
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     kernel32.AssignProcessToJobObject.restype = ctypes.c_int
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
-    if job is not None:
-        kernel32.AssignProcessToJobObject(job, int(process._handle))
+    if job is not None and not kernel32.AssignProcessToJobObject(job, int(process._handle)):
+        sys.stderr.write(
+            f"作业对象分配失败（{ctypes.get_last_error()}），启动器退出后子进程可能继续残留。\n"
+        )
     try:
         return process.wait()
     finally:

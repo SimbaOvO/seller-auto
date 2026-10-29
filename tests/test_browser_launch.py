@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import plistlib
@@ -11,7 +12,13 @@ from unittest import mock
 
 from seller_auto.browser_launch import (
     STEALTH_JS,
+    _CHROME_COMMANDS_SCRIPT,
+    _PROFILE_PIDS,
+    _decode_process_row,
+    _pids_for_profile,
+    chrome_browser_commands,
     chrome_for_testing_binary,
+    chrome_window_placement,
     command_uses_profile,
     default_playwright_browsers_dir,
     desktop_chrome_user_agent,
@@ -31,7 +38,7 @@ from seller_auto.pacing import DelaySettings
 class BrowserLaunchTests(unittest.TestCase):
     def test_background_uses_full_chrome_without_automation_markers(self) -> None:
         profile = Path("/tmp/seller-auto-data/profile")
-        options = persistent_context_options(profile, headless=True, chrome_version="156.0.8078.4")
+        options = persistent_context_options(profile, headless=True)
         self.assertFalse(options["headless"])
         self.assertEqual(options["channel"], "chrome-for-testing")
         self.assertNotIn("user_agent", options)
@@ -49,7 +56,6 @@ class BrowserLaunchTests(unittest.TestCase):
         options = persistent_context_options(
             Path("/tmp/seller-auto-data/profile"),
             headless=False,
-            chrome_version="156.0.8078.4",
         )
         self.assertFalse(options["headless"])
         self.assertEqual(options["channel"], "chrome-for-testing")
@@ -65,6 +71,12 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertFalse(command_uses_profile(enrich_command, profile))
         self.assertTrue(command_uses_profile(enrich_command, enrich))
         self.assertFalse(command_uses_profile(command + " --type=renderer", profile))
+        spaced = Path("C:/Users/Wang Xi/seller-auto/data/profile")
+        quoted = r'chrome.exe --user-data-dir="C:\Users\Wang Xi\seller-auto\data\profile"'
+        self.assertTrue(command_uses_profile(quoted, spaced))
+        self.assertFalse(command_uses_profile(quoted, Path("C:/Users/Wang Xi/seller-auto/data/profile-enrich")))
+        extended = r"chrome.exe --user-data-dir=\\?\E:\seller-auto\data\profile"
+        self.assertTrue(command_uses_profile(extended, profile))
 
     def test_read_chromium_version_from_plist(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -110,10 +122,68 @@ class BrowserLaunchTests(unittest.TestCase):
             binary.write_bytes(b"")
             completed = mock.Mock(stdout="Google Chrome for Testing 156.0.8078.4\n", stderr="")
             with (
+                mock.patch("seller_auto.browser_launch.sys.platform", "darwin"),
                 mock.patch("seller_auto.browser_launch._windows_file_version", return_value=None),
                 mock.patch("seller_auto.browser_launch.subprocess.run", return_value=completed),
             ):
                 self.assertEqual(read_chromium_version(root), "156.0.8078.4")
+
+    def test_windows_skips_launching_chrome_when_the_resource_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "chromium-1300" / "chrome-win64" / "chrome.exe"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"")
+            with (
+                mock.patch("seller_auto.browser_launch.sys.platform", "win32"),
+                mock.patch("seller_auto.browser_launch._windows_file_version", return_value=None),
+                mock.patch("seller_auto.browser_launch.subprocess.run") as run,
+            ):
+                self.assertIsNone(read_chromium_version(root))
+            run.assert_not_called()
+
+    def test_background_window_stays_visible_off_screen(self) -> None:
+        placement = chrome_window_placement(shown=False)
+        self.assertLess(placement.left, 0)
+        self.assertEqual(placement.flags & 0x0040, 0x0040)
+        self.assertEqual(placement.flags & 0x0010, 0x0010)
+        self.assertEqual(placement.restore_command, 0)
+
+    def test_foreground_window_is_restored_on_screen(self) -> None:
+        placement = chrome_window_placement(shown=True)
+        self.assertEqual(placement.left, 40)
+        self.assertEqual(placement.restore_command, 9)
+
+    def test_process_rows_keep_unicode_paths(self) -> None:
+        command = 'chrome.exe --user-data-dir="C:\\Users\\王希\\seller-auto\\data\\profile"'
+        encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+        self.assertEqual(_decode_process_row(f"4242 {encoded}"), (4242, command))
+        self.assertIsNone(_decode_process_row("not-a-row"))
+        self.assertIn("ToBase64String", _CHROME_COMMANDS_SCRIPT)
+        self.assertIn("Unicode", _CHROME_COMMANDS_SCRIPT)
+        completed = mock.Mock(stdout=f"4242 {encoded}\n", stderr="")
+        with (
+            mock.patch("seller_auto.browser_launch.sys.platform", "win32"),
+            mock.patch("seller_auto.browser_launch.subprocess.run", return_value=completed) as run,
+        ):
+            self.assertEqual(chrome_browser_commands(), [(4242, command)])
+        self.assertIn("powershell", run.call_args.args[0])
+        self.assertEqual(run.call_args.kwargs["encoding"], "utf-8-sig")
+
+    def test_profile_pids_are_reused_while_the_process_lives(self) -> None:
+        profile = Path("E:/seller-auto/data/profile")
+        command = r'chrome.exe --user-data-dir="E:\seller-auto\data\profile"'
+        _PROFILE_PIDS.clear()
+        try:
+            with (
+                mock.patch("seller_auto.browser_launch.chrome_browser_commands", return_value=[(99, command)]) as listed,
+                mock.patch("seller_auto.browser_launch._process_alive", return_value=True),
+            ):
+                self.assertEqual(_pids_for_profile(profile), {99})
+                self.assertEqual(_pids_for_profile(profile), {99})
+            self.assertEqual(listed.call_count, 1)
+        finally:
+            _PROFILE_PIDS.clear()
 
     def test_windows_file_version_does_not_launch_chrome(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

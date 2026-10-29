@@ -54,7 +54,7 @@ class BrowserRecoveryTests(unittest.TestCase):
             mock.patch.object(browser, "_wait_until_profile_free"),
             mock.patch("seller_auto.browser.mark_clean_shutdown", return_value=False),
             mock.patch("seller_auto.browser.use_playwright_browsers", return_value=Path("/tmp/browsers")),
-            mock.patch("seller_auto.browser.read_chromium_version", return_value="156.0.8078.4"),
+            mock.patch("seller_auto.browser_launch.read_chromium_version") as version,
             mock.patch(
                 "seller_auto.browser.persistent_context_options",
                 return_value={"user_data_dir": "/tmp/seller-auto-dead"},
@@ -65,6 +65,7 @@ class BrowserRecoveryTests(unittest.TestCase):
             browser.start()
         self.assertIs(browser.context, alive)
         playwright.chromium.launch_persistent_context.assert_called_once()
+        version.assert_not_called()
 
     def test_search_grid_is_not_a_verification_page(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))

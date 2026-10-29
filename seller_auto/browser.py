@@ -13,7 +13,6 @@ from seller_auto.browser_launch import (
     mark_clean_shutdown,
     persistent_context_options,
     profile_is_busy,
-    read_chromium_version,
     show_chrome_windows,
     use_playwright_browsers,
 )
@@ -135,11 +134,10 @@ class ArgentinaBrowser:
         self._wait_until_profile_free()
         if mark_clean_shutdown(self.profile_dir):
             log("已清掉上次异常退出标记")
-        browsers = use_playwright_browsers()
+        use_playwright_browsers()
         options = persistent_context_options(
             self.profile_dir,
             headless=self.headless,
-            chrome_version=read_chromium_version(browsers),
             locale=self.locale,
             accept_language=self.accept_language,
             timezone_id=self.timezone_id,
