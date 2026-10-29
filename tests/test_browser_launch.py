@@ -38,12 +38,13 @@ from seller_auto.pacing import DelaySettings
 class BrowserLaunchTests(unittest.TestCase):
     def test_background_uses_full_chrome_without_automation_markers(self) -> None:
         profile = Path("/tmp/seller-auto-data/profile")
-        options = persistent_context_options(profile, headless=True)
-        self.assertFalse(options["headless"])
+        options = persistent_context_options(profile, headless=True, chrome_version="156.0.8078.4")
+        self.assertTrue(options["headless"])
         self.assertEqual(options["channel"], "chrome-for-testing")
-        self.assertNotIn("user_agent", options)
+        self.assertEqual(options["user_agent"], desktop_chrome_user_agent("156.0.8078.4"))
+        self.assertNotIn("HeadlessChrome", options["user_agent"])
         self.assertNotIn("--headless", options["args"])
-        self.assertIn("--window-position=-32000,-32000", options["args"])
+        self.assertNotIn("--window-position=-32000,-32000", options["args"])
         self.assertIn("--enable-automation", options["ignore_default_args"])
         self.assertIn("--disable-blink-features=AutomationControlled", options["args"])
         self.assertEqual(options["locale"], "es-AR")

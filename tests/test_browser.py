@@ -54,18 +54,20 @@ class BrowserRecoveryTests(unittest.TestCase):
             mock.patch.object(browser, "_wait_until_profile_free"),
             mock.patch("seller_auto.browser.mark_clean_shutdown", return_value=False),
             mock.patch("seller_auto.browser.use_playwright_browsers", return_value=Path("/tmp/browsers")),
-            mock.patch("seller_auto.browser_launch.read_chromium_version") as version,
+            mock.patch("seller_auto.browser.read_chromium_version", return_value="156.0.8078.4") as version,
             mock.patch(
                 "seller_auto.browser.persistent_context_options",
                 return_value={"user_data_dir": "/tmp/seller-auto-dead"},
-            ),
+            ) as options,
             mock.patch("playwright.sync_api.sync_playwright") as sync_playwright,
         ):
             sync_playwright.return_value.start.return_value = playwright
             browser.start()
         self.assertIs(browser.context, alive)
         playwright.chromium.launch_persistent_context.assert_called_once()
-        version.assert_not_called()
+        version.assert_called_once_with(Path("/tmp/browsers"))
+        self.assertEqual(options.call_args.kwargs["chrome_version"], "156.0.8078.4")
+        self.assertTrue(options.call_args.kwargs["headless"])
 
     def test_search_grid_is_not_a_verification_page(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
@@ -74,24 +76,34 @@ class BrowserRecoveryTests(unittest.TestCase):
         page.url = "https://listado.mercadolibre.com.ar/panel-perforado-para-pared"
         self.assertFalse(browser.needs_verification(page))
 
-    def test_verification_shows_the_same_page(self) -> None:
+    def test_verification_reopens_in_the_foreground(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
         page = mock.Mock()
+        page.url = "https://www.mercadolibre.com.ar/gz/captcha"
         browser.list_page = page
+        browser.detail_page = None
         browser.headless = True
-        with mock.patch.object(browser, "_bring_forward") as forward:
+        with mock.patch.object(browser, "_reopen") as reopen:
             shown = browser._show_for_verification(page)
         self.assertIs(shown, page)
-        self.assertFalse(browser.headless)
-        forward.assert_called_once_with(page)
+        reopen.assert_called_once_with(
+            headless=False,
+            urls=["https://www.mercadolibre.com.ar/gz/captcha"],
+            restore_detail=False,
+        )
 
-    def test_background_hides_without_relaunch(self) -> None:
+    def test_return_to_background_reopens_headless(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
         page = mock.Mock()
+        page.url = "https://www.mercadolibre.com.ar/item"
         browser.list_page = page
+        browser.detail_page = None
         browser.headless = False
         browser.background = True
-        with mock.patch.object(browser, "_keep_background") as park:
+        with mock.patch.object(browser, "_reopen") as reopen:
             browser._return_to_background(page)
-        self.assertTrue(browser.headless)
-        park.assert_called_once_with()
+        reopen.assert_called_once_with(
+            headless=True,
+            urls=["https://www.mercadolibre.com.ar/item"],
+            restore_detail=False,
+        )

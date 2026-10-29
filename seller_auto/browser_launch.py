@@ -1,4 +1,4 @@
-"""用 Playwright 启动完整 Chrome for Testing。不使用 headless，去掉 webdriver 标记。"""
+"""后台启动完整 Chrome for Testing。去掉自动化标记，不改画布、WebGL 或操作系统。"""
 
 from __future__ import annotations
 
@@ -621,20 +621,19 @@ def persistent_context_options(
     profile_dir: Path,
     *,
     headless: bool,
+    chrome_version: str | None = None,
     locale: str = "es-AR",
     accept_language: str = "es-AR,es;q=0.9",
     timezone_id: str = "America/Argentina/Buenos_Aires",
     geolocation: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """交给 Playwright 启动有界面的 Chrome。headless 只表示窗口先放在屏幕外。"""
+    """后台用完整 Chrome 的无头模式。不传 channel 时，Playwright 会改用精简的 headless shell。"""
 
     args = [item for item in LAUNCH_ARGS if not item.startswith("--lang=")]
     args.append(f"--lang={locale}")
-    if headless:
-        args.append("--window-position=-32000,-32000")
-    return {
+    options: dict[str, Any] = {
         "user_data_dir": str(profile_dir.resolve()),
-        "headless": False,
+        "headless": headless,
         "channel": "chrome-for-testing",
         "locale": locale,
         "timezone_id": timezone_id,
@@ -645,3 +644,6 @@ def persistent_context_options(
         "ignore_default_args": ["--enable-automation"],
         "args": args,
     }
+    if headless and chrome_version:
+        options["user_agent"] = desktop_chrome_user_agent(chrome_version)
+    return options
