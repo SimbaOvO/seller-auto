@@ -203,7 +203,7 @@ def normalize_match(raw: Any) -> dict[str, Any]:
 
 
 def filter_matches(matches: list[Any], threshold: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """保留同款，以及达到阈值的矩形相似和规格不同。每类各自进入销量筛选。"""
+    """保留同款，以及达到阈值的矩形相似和规格不同。每类进自己的池；后两类记下自己这条链接。"""
 
     if not 0 <= threshold <= 1:
         raise MatchInputError("相似度阈值必须在 0 到 1 之间")

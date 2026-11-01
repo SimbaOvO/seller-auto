@@ -1767,19 +1767,23 @@ class SellerAutoService:
                 if candidate["key"] in product["checked_keys"]:
                     skipped.append(candidate["candidate_id"])
                     continue
-                if variant and not has_sales(card_text):
-                    product["checked_keys"].append(candidate["key"])
-                    skipped.append(candidate["candidate_id"])
-                    self._commit_locked()
-                    step("销量", f"卡片没有 vendido，不打开详情 {public_url(candidate['url'])}")
-                    continue
-                if has_sales(card_text) and not self._fits_top(product, card_text, item):
+                if variant:
+                    if not self._fits_top(product, card_text, item):
+                        product["checked_keys"].append(candidate["key"])
+                        skipped.append(candidate["candidate_id"])
+                        self._commit_locked()
+                        note = card_text if has_sales(card_text) else "没有销量"
+                        step("销量", f"挤不进前10，跳过 {note} {public_url(candidate['url'])}")
+                        continue
+                    record_from_card = True
+                elif has_sales(card_text) and not self._fits_top(product, card_text, item):
                     product["checked_keys"].append(candidate["key"])
                     skipped.append(candidate["candidate_id"])
                     self._commit_locked()
                     step("销量", f"卡片销量挤不进前10，跳过 {card_text} {public_url(candidate['url'])}")
                     continue
-                record_from_card = variant or (source == "recommendation" and has_sales(card_text))
+                else:
+                    record_from_card = source == "recommendation" and has_sales(card_text)
             if record_from_card:
                 if not candidate.get("image_path"):
                     self._ensure_candidate_files([candidate], page_url=str(candidate.get("url") or ""))
@@ -1797,8 +1801,11 @@ class SellerAutoService:
                     )
                     recorded.append(product["matches"][-1])
                     self._commit_locked()
-                note = "不打开详情，也不抓广告 " if variant else "不打开详情 "
-                step("销量", f"卡片已有销量，{note}{_sale_note(item)}{card_text} {public_url(candidate['url'])}")
+                if variant and not has_sales(card_text):
+                    step("销量", f"卡片没有 vendido，仍记录这条供人工复核 {public_url(candidate['url'])}")
+                else:
+                    note = "不打开详情，也不抓广告 " if variant else "不打开详情 "
+                    step("销量", f"卡片已有销量，{note}{_sale_note(item)}{card_text} {public_url(candidate['url'])}")
                 continue
             browser = self._ensure_browser()
             browser.ml_cooldown.acquire()
@@ -2151,7 +2158,8 @@ class SellerAutoService:
             "不要记成同款：similar=false，relation 填 functional，confidence 填相似度。"
             "容量、重量、尺寸、体积、功率这类单位对不上，但整体用途相同，相似度不低于 0.8 时，"
             "也不要记成同款：similar=false，relation 填 spec，confidence 填相似度。"
-            "这两类只看卡片：已经写了 vendidos 的直接记录并走表格，不打开详情，也不访问广告位；卡片没有销量的不记录。"
+            "这两类只看卡片：不打开详情，也不访问广告位。记录的是这条候选自己的链接，供人工复核，不要改写成别的同款。"
+            "卡片有 vendidos 的按销量进自己那一池；卡片没有销量的也记下这条链接。"
             "其他外形不同的不要填 functional 或 spec。"
             f"判断完调用 {submit}，model_name 填当前模型名。"
         )

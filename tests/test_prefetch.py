@@ -610,13 +610,17 @@ class PrefetchTests(unittest.TestCase):
         finally:
             self._restore_sales_readers()
         self.assertEqual(opened, [])
-        self.assertIn("rect-empty", payload.data["skipped"])
-        self.assertNotIn("MLAEMPTYRECT", [item["key"] for item in product["matches"]])
+        self.assertNotIn("rect-empty", payload.data["skipped"])
+        empty = next(item for item in product["matches"] if item["key"] == "MLAEMPTYRECT")
+        self.assertEqual(empty["relation"], "functional")
+        self.assertEqual(empty["sales_text"], "")
+        self.assertEqual(empty["url"], "https://articulo.mercadolibre.com.ar/MLA-empty-rect")
+        self.assertTrue(empty["ads_complete"])
         saved = next(item for item in product["matches"] if item["key"] == "MLARECT")
         self.assertEqual(saved["relation"], "functional")
         self.assertEqual(saved["sales_text"], "+5 vendidos")
         self.assertTrue(saved["ads_complete"])
-        self.assertEqual(len(product["matches"]), 11)
+        self.assertEqual(len(product["matches"]), 12)
 
     def test_capacity_mismatch_is_recorded_apart_from_exact_matches(self) -> None:
         product = self.service.state["products"]["B07LCLQ47D"]
