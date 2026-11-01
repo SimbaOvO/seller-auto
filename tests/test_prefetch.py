@@ -673,6 +673,38 @@ class PrefetchTests(unittest.TestCase):
         self.assertEqual(len(product["matches"]), 11)
         self.assertEqual(payload.data["recorded"][0]["relation"], "spec")
 
+    def test_exact_match_without_card_sales_records_the_detail_subtitle(self) -> None:
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["listing"]["candidates"].append(
+            {
+                "candidate_id": "one-sale",
+                "url": "https://www.mercadolibre.com.ar/p/MLA2078452646",
+                "title": "Modelo De Desarrollo Del Feto",
+                "sales_text": "",
+                "key": "MLA2078452646",
+                "similar": True,
+                "similarity": 0.93,
+            }
+        )
+        opened = self._stub_detail(
+            {"https://www.mercadolibre.com.ar/p/MLA2078452646": "Nuevo | 1 vendido"}
+        )
+        try:
+            payload = self.service._open_judged_matches(
+                product,
+                [{"candidate_id": "one-sale", "similar": True, "confidence": 0.93, "reason": "同款"}],
+                "cursor-grok-4.5-low-fast",
+                "search",
+                None,
+            )
+        finally:
+            self._restore_sales_readers()
+        self.assertEqual(opened, ["https://www.mercadolibre.com.ar/p/MLA2078452646"])
+        saved = next(item for item in product["matches"] if item["key"] == "MLA2078452646")
+        self.assertEqual(saved["sales_text"], "Nuevo | 1 vendido")
+        self.assertFalse(saved["ads_complete"])
+        self.assertEqual(payload.data["recorded"][0]["sales_text"], "Nuevo | 1 vendido")
+
     def test_detail_without_sales_is_not_recorded(self) -> None:
         product = self.service.state["products"]["B07LCLQ47D"]
         product["listing"]["candidates"].append(

@@ -1827,7 +1827,7 @@ class SellerAutoService:
                     keep_open = True
                     record = True
             if not sales["has_sales"]:
-                step("销量", f"没有 vendido，不记录 {public_url(candidate['url'])}")
+                step("销量", f"详情已打开，没有读到 vendido，不记录 {public_url(candidate['url'])}")
             elif not record:
                 step("销量", f"详情销量挤不进前10，跳过 {sales['sales_text']} {public_url(candidate['url'])}")
             if not keep_open:

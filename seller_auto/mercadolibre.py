@@ -112,21 +112,35 @@ CARD_SCRIPT = """
 HEADER_SALES_SCRIPT = """
 () => {
   const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
-  const selectors = [
-    ".ui-pdp-header__subtitle",
-    ".ui-pdp-subtitle",
-    ".ui-pdp-header span",
-    ".ui-pdp-header p",
-  ];
+  const sold = /vendidos?/i;
+  const skip = (el) => Boolean(el.closest(
+    ".ui-seller-data, .ui-pdp-seller__header, [class*='seller'], .ui-recommendations, .ui-pdp-recommendations"
+  ));
   const found = [];
-  for (const selector of selectors) {
-    for (const el of document.querySelectorAll(selector)) {
+  const seen = new Set();
+  const push = (text) => {
+    const value = clean(text);
+    if (!value || value.length > 500 || seen.has(value)) return;
+    seen.add(value);
+    found.push(value);
+  };
+  for (const el of document.querySelectorAll(".ui-pdp-header__subtitle, .ui-pdp-subtitle, [class*='subtitle']")) {
+    if (!skip(el)) push(el.innerText || el.textContent);
+  }
+  for (const selector of [".ui-pdp-header", ".ui-pdp-container__top-wrapper", ".ui-pdp-container--column-center"]) {
+    const root = document.querySelector(selector);
+    if (!root) continue;
+    push((root.innerText || "").slice(0, 500));
+    let kept = 0;
+    for (const el of root.querySelectorAll("span, p")) {
+      if (skip(el)) continue;
       const text = clean(el.innerText || el.textContent);
-      if (text && text.length <= 120) found.push(text);
+      if (!text || text.length > 80 || !sold.test(text)) continue;
+      push(text);
+      kept += 1;
+      if (kept >= 12) break;
     }
   }
-  const header = document.querySelector(".ui-pdp-header");
-  if (header) found.push(clean(header.innerText).slice(0, 400));
   return found;
 }
 """
