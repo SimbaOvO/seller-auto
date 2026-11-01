@@ -141,6 +141,13 @@ class WorkbookTests(unittest.TestCase):
         top = ranked_matches(_product())
         self.assertEqual([item["candidate_id"] for item in top], ["top-sales", "mid-sales", "low-sales"])
         self.assertEqual(lowest_selling_price(top), 12000)
+        fallback = _product()
+        for item in fallback["matches"]:
+            item["fallback"] = True
+        self.assertEqual(
+            [item["candidate_id"] for item in ranked_matches(fallback)],
+            ["low-sales", "mid-sales", "top-sales"],
+        )
 
     def test_sales_cutoff_waits_until_ten_matches(self) -> None:
         product = _product()

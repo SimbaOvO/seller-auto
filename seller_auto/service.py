@@ -73,6 +73,8 @@ from seller_auto.step_log import step
 from seller_auto.urls import UrlError, clean_keywords, ml_search_url, parse_focus_product, resolve_store_input
 
 BATCH_SIZE = 24
+NEAR_LINK_LIMIT = 5
+NEAR_MIN_SIMILARITY = 0.6
 
 
 @dataclass
@@ -1959,6 +1961,11 @@ class SellerAutoService:
         waiting = self._sales_wait_payload(product_id, "")
         if waiting is not None:
             return waiting
+        product = (self._require_state().get("products") or {}).get(product_id) or {}
+        if product and not _exact_matches(product):
+            blocked = self._fill_near_matches(product)
+            if blocked is not None:
+                return blocked
         self._start_export()
         state = self._require_state()
         if state.get("single_product") or state.get("amazon_done"):
@@ -1981,6 +1988,80 @@ class SellerAutoService:
         elif opened.data.get("status") == "end_of_store":
             opened.data["message"] = "店铺列表已经读完。表格在后台写入，不要再调用 export_results 或 next_amazon_product。"
         return opened
+
+    def _fill_near_matches(self, product: dict[str, Any]) -> ToolPayload | None:
+        """没有同款时，按相似度从高到低补有销量的链接，最多 5 条，写进原来那一行。"""
+
+        recorded = 0
+        for confidence, candidate in _near_candidates(product):
+            if recorded >= NEAR_LINK_LIMIT:
+                break
+            if candidate.get("key") in (product.get("checked_keys") or []):
+                continue
+            card_text = str(candidate.get("sales_text") or "")
+            item = {
+                "candidate_id": candidate.get("candidate_id"),
+                "confidence": confidence,
+                "reason": candidate.get("reason") or "相似度补位",
+                "relation": "same",
+            }
+            source = "recommendation" if candidate.get("parent_url") else "search"
+            if has_sales(card_text):
+                self._remember_fallback(product, candidate, item, source, card_text, candidate.get("price"))
+                recorded += 1
+                step("销量", f"没有同款，按相似度补记 {card_text} {public_url(candidate['url'])}")
+                continue
+            browser = self._ensure_browser()
+            browser.ml_cooldown.acquire()
+            page = browser.open_detail(candidate["url"])
+            blocked = browser.ensure_clear(page, "ml")
+            if blocked:
+                self._save()
+                return self._blocked(blocked)
+            page = browser.live_page(page)
+            browser.pause_ml_read()
+            sales = sales_from_text(read_sales_text(page))
+            price = read_price(page) or candidate.get("price")
+            product.setdefault("checked_keys", []).append(candidate["key"])
+            browser.close_detail()
+            if not sales["has_sales"]:
+                step("销量", f"相似度补位没有 vendido，不记录 {public_url(candidate['url'])}")
+                continue
+            image_path = str(candidate.get("image_path") or "")
+            self._remember_fallback(product, candidate, item, source, sales["sales_text"], price, image_path)
+            recorded += 1
+            step("销量", f"没有同款，按相似度补记 {sales['sales_text']} {public_url(candidate['url'])}")
+        if recorded:
+            self._save()
+            step("销量", f"没有同款，已按相似度补进 {recorded} 条有销量链接")
+        return None
+
+    def _remember_fallback(
+        self,
+        product: dict[str, Any],
+        candidate: dict[str, Any],
+        item: dict[str, Any],
+        source: str,
+        sales_text: str,
+        price: Any,
+        image_path: str = "",
+    ) -> None:
+        self._remember_sale(
+            product,
+            candidate,
+            item,
+            source,
+            candidate.get("parent_url") or None,
+            str(candidate.get("model_name") or ""),
+            sales_text,
+            image_path=image_path or str(candidate.get("image_path") or ""),
+            price=price,
+        )
+        saved = product["matches"][-1]
+        saved["fallback"] = True
+        saved["ads_scraped"] = True
+        saved["ads_complete"] = True
+        saved["ad_candidates"] = []
 
     def _step_message(self, done: str, step_name: str) -> str:
         hints = {
@@ -2161,6 +2242,8 @@ class SellerAutoService:
             "这两类只看卡片：不打开详情，也不访问广告位。记录的是这条候选自己的链接，供人工复核，不要改写成别的同款。"
             "卡片有 vendidos 的按销量进自己那一池；卡片没有销量的也记下这条链接。"
             "其他外形不同的不要填 functional 或 spec。"
+            "不是同款、也不是标题明显不同时，confidence 填真实相似度，不要填 1。"
+            "一条商品没有同款时，服务会把相似度大于 0.6 且有销量的链接按相似度从高到低取前 5 条，写进原来这一行。"
             f"判断完调用 {submit}，model_name 填当前模型名。"
         )
 
@@ -2388,6 +2471,46 @@ def _replay_ad_batch(product: dict[str, Any]) -> tuple[dict[str, Any], list[dict
         if pending:
             return match, pending[:BATCH_SIZE]
     return None
+
+
+def _exact_matches(product: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in product.get("matches") or []
+        if item.get("url") and match_relation(item) == "same" and not item.get("fallback")
+    ]
+
+
+def _near_candidates(product: dict[str, Any]) -> list[tuple[float, dict[str, Any]]]:
+    """没有同款时的补位：已判断、相似度大于 0.6，排除标题一票否决。"""
+
+    judged = set(product.get("judged_ids") or [])
+    taken = {item.get("key") for item in product.get("matches") or []}
+    pools = list((product.get("listing") or {}).get("candidates") or [])
+    for match in product.get("matches") or []:
+        pools.extend(match.get("ad_candidates") or [])
+    found: list[tuple[float, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for candidate in pools:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        key = str(candidate.get("key") or "")
+        if not candidate_id or candidate_id not in judged or key in taken or key in seen:
+            continue
+        if candidate.get("reason") == TITLE_MISMATCH_REASON or candidate.get("model_name") == TITLE_FILTER_MODEL:
+            continue
+        try:
+            confidence = float(candidate.get("similarity") or 0)
+        except (TypeError, ValueError):
+            continue
+        if confidence <= NEAR_MIN_SIMILARITY:
+            continue
+        similar = bool(candidate.get("similar"))
+        if not similar and match_relation(candidate) == "same" and confidence >= 0.999:
+            continue
+        seen.add(key)
+        found.append((confidence, candidate))
+    found.sort(key=lambda item: (-item[0], str(item[1].get("candidate_id") or "")))
+    return found
 
 
 def _sale_note(item: dict[str, Any]) -> str:

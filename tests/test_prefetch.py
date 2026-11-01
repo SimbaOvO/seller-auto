@@ -677,6 +677,54 @@ class PrefetchTests(unittest.TestCase):
         self.assertEqual(len(product["matches"]), 11)
         self.assertEqual(payload.data["recorded"][0]["relation"], "spec")
 
+    def test_zero_exact_matches_keep_five_sold_links_by_similarity(self) -> None:
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["judged_ids"] = []
+        product["matches"] = []
+        product["checked_keys"] = []
+        product["listing"]["candidates"] = []
+        specs = [
+            ("high", 0.91, "+20 vendidos", ""),
+            ("mid", 0.8, "", "Nuevo | 1 vendido"),
+            ("low", 0.7, "", ""),
+            ("edge", 0.6, "+9 vendidos", ""),
+            ("reject", 1, "+100 vendidos", ""),
+            ("sixth", 0.75, "+3 vendidos", ""),
+            ("seventh", 0.72, "+4 vendidos", ""),
+            ("eighth", 0.71, "+8 vendidos", ""),
+            ("ninth", 0.69, "+7 vendidos", ""),
+        ]
+        for name, confidence, card, _detail in specs:
+            product["listing"]["candidates"].append(
+                {
+                    "candidate_id": name,
+                    "url": f"https://www.mercadolibre.com.ar/p/MLA-{name}",
+                    "title": "Modelo",
+                    "sales_text": card,
+                    "key": f"MLA{name}",
+                    "similar": False,
+                    "similarity": confidence,
+                    "reason": "标题明显不同" if name == "reject" else "接近",
+                    "model_name": "title-filter" if name == "reject" else "model",
+                }
+            )
+            product["judged_ids"].append(name)
+        opened = self._stub_detail(
+            {"https://www.mercadolibre.com.ar/p/MLA-mid": "Nuevo | 1 vendido"}
+        )
+        try:
+            blocked = self.service._fill_near_matches(product)
+        finally:
+            self._restore_sales_readers()
+        self.assertIsNone(blocked)
+        self.assertEqual(opened, ["https://www.mercadolibre.com.ar/p/MLA-mid"])
+        saved = [item["candidate_id"] for item in product["matches"]]
+        self.assertEqual(saved, ["high", "mid", "sixth", "seventh", "eighth"])
+        self.assertTrue(all(item.get("fallback") and item["ads_complete"] for item in product["matches"]))
+        self.assertNotIn("edge", saved)
+        self.assertNotIn("reject", saved)
+        self.assertNotIn("ninth", saved)
+
     def test_exact_match_without_card_sales_records_the_detail_subtitle(self) -> None:
         product = self.service.state["products"]["B07LCLQ47D"]
         product["listing"]["candidates"].append(

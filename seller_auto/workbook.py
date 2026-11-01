@@ -123,13 +123,23 @@ def ranked_matches(
         for item in product.get("matches") or []
         if item.get("url") and match_relation(item) == pool
     ]
-    rows.sort(
-        key=lambda item: (
-            -sales_count(str(item.get("sales_text") or "")),
-            -float(item.get("confidence") or item.get("similarity") or 0),
-            str(item.get("candidate_id") or item.get("url") or ""),
+    by_similarity = bool(rows) and all(item.get("fallback") for item in rows)
+    if by_similarity:
+        rows.sort(
+            key=lambda item: (
+                -float(item.get("confidence") or item.get("similarity") or 0),
+                -sales_count(str(item.get("sales_text") or "")),
+                str(item.get("candidate_id") or item.get("url") or ""),
+            )
         )
-    )
+    else:
+        rows.sort(
+            key=lambda item: (
+                -sales_count(str(item.get("sales_text") or "")),
+                -float(item.get("confidence") or item.get("similarity") or 0),
+                str(item.get("candidate_id") or item.get("url") or ""),
+            )
+        )
     return rows[:limit]
 
 
