@@ -8,13 +8,14 @@ from typing import Any
 
 from seller_auto.browser import ArgentinaBrowser
 from seller_auto.browser_launch import snapshot_profile
-from seller_auto.lingdong import apply_last_mile, collect_market_quotes, quote_links
+from seller_auto.lingdong import apply_last_mile, collect_market_quotes, quote_jobs
+from seller_auto.matches import known_orders_fields
 from seller_auto.pacing import DelaySettings
 from seller_auto.sellersprite import open_1688_from_row, open_competitor
 from seller_auto.sourcing import read_page_source
 from seller_auto.step_log import step
 from seller_auto.storage import atomic_write_json
-from seller_auto.workbook import fill_package_rows, ranked_matches, template_path
+from seller_auto.workbook import fill_package_rows, sheet_entries, template_path
 
 
 def package_incomplete(package: Any) -> bool:
@@ -31,7 +32,7 @@ def missing_package_ids(state: dict[str, Any]) -> list[str]:
     ids: list[str] = []
     for product_id in list(state.get("product_order") or []):
         product = (state.get("products") or {}).get(product_id) or {}
-        if not ranked_matches(product, limit=1):
+        if not sheet_entries(product):
             continue
         if not package_incomplete(product.get("package_size")):
             continue
@@ -129,9 +130,7 @@ def backfill_packages(
         jobs = []
         for product_id in targets:
             product = state["products"][product_id]
-            links = quote_links(product)
-            if links:
-                jobs.append({"product_id": product_id, "links": links, "package": product.get("package_size")})
+            jobs.extend(quote_jobs(product_id, product))
         if jobs:
             if quote is None:
                 assert browser is not None
@@ -144,7 +143,10 @@ def backfill_packages(
             for job, item in zip(jobs, quotes):
                 product = state["products"][job["product_id"]]
                 if item.get("orders") is not None:
-                    product["market_orders"] = item["orders"]
+                    field = str(job.get("orders_field") or "market_orders")
+                    if field not in known_orders_fields():
+                        field = "market_orders"
+                    product[field] = item["orders"]
                     result["quoted"] += 1
         products = [
             state["products"][product_id]

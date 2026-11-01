@@ -537,6 +537,142 @@ class PrefetchTests(unittest.TestCase):
         self.assertIn("need-detail", payload.data["skipped"])
         self.assertNotIn("MLAHIDDEN", [item["key"] for item in product["matches"]])
 
+    def test_rectangular_variant_does_not_share_the_exact_top_ten(self) -> None:
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["matches"] = [
+            {
+                "url": f"https://articulo.mercadolibre.com.ar/MLA-{index}",
+                "key": f"MLA{index}",
+                "sales_text": "+100 vendidos",
+                "source": "search",
+                "candidate_id": f"old-{index}",
+                "relation": "same",
+                "ads_scraped": True,
+                "ads_complete": True,
+                "ad_candidates": [],
+            }
+            for index in range(10)
+        ]
+        product["listing"]["candidates"].extend(
+            [
+                {
+                    "candidate_id": "rect-sold",
+                    "url": "https://articulo.mercadolibre.com.ar/MLA-rect",
+                    "title": "Soporte rectangular",
+                    "sales_text": "+5 vendidos",
+                    "price": 9000,
+                    "key": "MLARECT",
+                    "similar": False,
+                    "relation": "functional",
+                    "similarity": 0.91,
+                },
+                {
+                    "candidate_id": "rect-empty",
+                    "url": "https://articulo.mercadolibre.com.ar/MLA-empty-rect",
+                    "title": "Soporte rectangular",
+                    "sales_text": "",
+                    "key": "MLAEMPTYRECT",
+                    "similar": False,
+                    "relation": "functional",
+                    "similarity": 0.9,
+                },
+            ]
+        )
+        opened = self._stub_detail(
+            {
+                "https://articulo.mercadolibre.com.ar/MLA-rect": "+5 vendidos",
+                "https://articulo.mercadolibre.com.ar/MLA-empty-rect": "",
+            }
+        )
+        try:
+            payload = self.service._open_judged_matches(
+                product,
+                [
+                    {
+                        "candidate_id": "rect-sold",
+                        "similar": False,
+                        "relation": "functional",
+                        "confidence": 0.91,
+                        "reason": "矩形支架，用途相同",
+                    },
+                    {
+                        "candidate_id": "rect-empty",
+                        "similar": False,
+                        "relation": "functional",
+                        "confidence": 0.9,
+                        "reason": "矩形但没有销量",
+                    },
+                ],
+                "cursor-grok-4.5-low-fast",
+                "search",
+                None,
+            )
+        finally:
+            self._restore_sales_readers()
+        self.assertEqual(opened, [])
+        self.assertIn("rect-empty", payload.data["skipped"])
+        self.assertNotIn("MLAEMPTYRECT", [item["key"] for item in product["matches"]])
+        saved = next(item for item in product["matches"] if item["key"] == "MLARECT")
+        self.assertEqual(saved["relation"], "functional")
+        self.assertEqual(saved["sales_text"], "+5 vendidos")
+        self.assertTrue(saved["ads_complete"])
+        self.assertEqual(len(product["matches"]), 11)
+
+    def test_capacity_mismatch_is_recorded_apart_from_exact_matches(self) -> None:
+        product = self.service.state["products"]["B07LCLQ47D"]
+        product["matches"] = [
+            {
+                "url": f"https://articulo.mercadolibre.com.ar/MLA-{index}",
+                "key": f"MLA{index}",
+                "sales_text": "+100 vendidos",
+                "source": "search",
+                "candidate_id": f"old-{index}",
+                "ads_scraped": True,
+                "ads_complete": True,
+                "ad_candidates": [],
+            }
+            for index in range(10)
+        ]
+        product["listing"]["candidates"].append(
+            {
+                "candidate_id": "capacity",
+                "url": "https://articulo.mercadolibre.com.ar/MLA-cap",
+                "title": "Botella 500ml",
+                "sales_text": "+2 vendidos",
+                "price": 33000,
+                "key": "MLACAP",
+                "similar": False,
+                "relation": "spec",
+                "similarity": 0.9,
+            }
+        )
+        opened = self._stub_detail({"https://articulo.mercadolibre.com.ar/MLA-cap": "+2 vendidos"})
+        try:
+            payload = self.service._open_judged_matches(
+                product,
+                [
+                    {
+                        "candidate_id": "capacity",
+                        "similar": False,
+                        "relation": "容量",
+                        "confidence": 0.9,
+                        "reason": "容量不同，用途相同",
+                    }
+                ],
+                "cursor-grok-4.5-low-fast",
+                "search",
+                None,
+            )
+        finally:
+            self._restore_sales_readers()
+        self.assertEqual(opened, [])
+        saved = next(item for item in product["matches"] if item["key"] == "MLACAP")
+        self.assertEqual(saved["relation"], "spec")
+        self.assertEqual(saved["sales_text"], "+2 vendidos")
+        self.assertTrue(saved["ads_complete"])
+        self.assertEqual(len(product["matches"]), 11)
+        self.assertEqual(payload.data["recorded"][0]["relation"], "spec")
+
     def test_detail_without_sales_is_not_recorded(self) -> None:
         product = self.service.state["products"]["B07LCLQ47D"]
         product["listing"]["candidates"].append(

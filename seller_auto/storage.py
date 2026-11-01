@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from seller_auto.matches import RELATION_SAME, VARIANT_RELATIONS, fee_field, match_relation, orders_field
 from seller_auto.progress import next_required_step
 from seller_auto.sales import sales_count
 
@@ -61,12 +62,13 @@ def public_url(url: str, item_key: str = "") -> str:
     return urlunsplit((parts.scheme or "https", parts.netloc, parts.path, "", ""))
 
 
-def similarity_rows(product: dict[str, Any]) -> list[dict[str, Any]]:
-    """只对已经通过相似和销量筛选的同款按销量倒序，销量相同再看相似度。"""
+def similarity_rows(product: dict[str, Any], relation: str | None = None) -> list[dict[str, Any]]:
+    """已经通过筛选的记录按销量倒序。同款和矩形相似分开排。"""
 
+    pool = match_relation(relation) if relation else RELATION_SAME
     rows = []
     for match in product.get("matches") or []:
-        if match.get("confidence") is None:
+        if match.get("confidence") is None or match_relation(match) != pool:
             continue
         rows.append(
             {
@@ -78,6 +80,7 @@ def similarity_rows(product: dict[str, Any]) -> list[dict[str, Any]]:
                 "sales_text": match.get("sales_text") or "",
                 "price": match.get("price"),
                 "source": match.get("source"),
+                "relation": pool,
             }
         )
     rows.sort(
@@ -113,6 +116,7 @@ def build_export(state: dict[str, Any]) -> dict[str, Any]:
                     "image_path": item.get("image_path"),
                     "model_name": model_name,
                     "title": item.get("title") or "",
+                    "relation": match_relation(item),
                 }
             )
         matches.sort(
@@ -140,6 +144,10 @@ def build_export(state: dict[str, Any]) -> dict[str, Any]:
                 "top_links": similarity_rows(product)[:10],
             }
         )
+        for relation in VARIANT_RELATIONS:
+            products[-1][f"{relation}_top_links"] = similarity_rows(product, relation=relation)[:10]
+            products[-1][orders_field(relation)] = product.get(orders_field(relation))
+            products[-1][fee_field(relation)] = product.get(fee_field(relation))
     return {
         "store_url": state.get("store_url"),
         "seller_id": state.get("seller_id"),

@@ -166,6 +166,30 @@ class WorkbookTests(unittest.TestCase):
         self.assertTrue(can_enter_top(product, "+100 vendidos", confidence=0.9, candidate_id="newer"))
         self.assertFalse(can_enter_top(product, "+100 vendidos", confidence=0.5, candidate_id="m9"))
         self.assertTrue(can_enter_top(product, "+100 vendidos", confidence=0.5, candidate_id="a"))
+        product["matches"].append(
+            {
+                "candidate_id": "rect",
+                "url": "https://www.mercadolibre.com.ar/p/MLARECT",
+                "sales_text": "+5 vendidos",
+                "confidence": 0.9,
+                "relation": "functional",
+            }
+        )
+        self.assertEqual([item["candidate_id"] for item in ranked_matches(product)], [f"m{index}" for index in range(10)])
+        self.assertTrue(can_enter_top(product, "+5 vendidos", relation="functional", candidate_id="rect"))
+        self.assertEqual([item["candidate_id"] for item in ranked_matches(product, relation="functional")], ["rect"])
+        product["matches"].append(
+            {
+                "candidate_id": "capacity",
+                "url": "https://www.mercadolibre.com.ar/p/MLACAP",
+                "sales_text": "+1 vendido",
+                "confidence": 0.88,
+                "relation": "spec",
+            }
+        )
+        self.assertTrue(can_enter_top(product, "+1 vendido", relation="spec", candidate_id="capacity"))
+        self.assertEqual([item["candidate_id"] for item in ranked_matches(product, relation="spec")], ["capacity"])
+        self.assertNotIn("capacity", [item["candidate_id"] for item in ranked_matches(product)])
 
     def test_appends_a_row_with_price_links_and_listing_image(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -281,6 +305,74 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(sheet.cell(3, _column(sheet, "尾程")).value, "=(Q3+R3+S3)*J3")
             self.assertEqual(sheet.cell(3, _column(sheet, "FBA")).value, 2740)
             self.assertEqual(sheet.cell(3, _column(sheet, "销售价格")).value, "=K3*J3")
+
+    def test_rectangular_variant_opens_its_own_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.xlsx"
+            _mini_workbook(path)
+            product = _product()
+            product["chinese_name"] = "圆形支架"
+            product["market_orders"] = 30
+            product["functional_market_orders"] = 8
+            product["spec_market_orders"] = 4
+            product["fba_fee"] = 2740
+            product["functional_fba_fee"] = 1430
+            product["spec_fba_fee"] = 9948
+            product["matches"].append(
+                {
+                    "candidate_id": "rect",
+                    "url": "https://www.mercadolibre.com.ar/p/MLARECT?tracking=1",
+                    "sales_text": "+25 vendidos",
+                    "price": 9000,
+                    "confidence": 0.86,
+                    "relation": "functional",
+                }
+            )
+            product["matches"].append(
+                {
+                    "candidate_id": "capacity",
+                    "url": "https://www.mercadolibre.com.ar/p/MLACAP",
+                    "sales_text": "+8 vendidos",
+                    "price": 33000,
+                    "confidence": 0.84,
+                    "relation": "spec",
+                }
+            )
+            self.assertEqual(write_product_workbook(path, [product]), 3)
+            sheet = load_workbook(path)[TEMPLATE_SHEET]
+            name = _column(sheet, "名称")
+            sku = _column(sheet, "SKU")
+            price = _column(sheet, "售价")
+            fba = _column(sheet, "FBA")
+            self.assertEqual(sheet.cell(3, name).value, "圆形支架\n（30单）")
+            self.assertEqual(sheet.cell(3, sku).value, "cubiertas hendidura para estufa")
+            self.assertEqual(sheet.cell(3, price).value, 12000)
+            self.assertEqual(sheet.cell(3, fba).value, 2740)
+            self.assertEqual(sheet.cell(3, _column(sheet, "MKD链接", 1)).value, "https://www.mercadolibre.com.ar/p/MLA3")
+            self.assertEqual(sheet.cell(4, name).value, "圆形支架（矩形）\n（8单）")
+            self.assertEqual(sheet.cell(4, sku).value, "cubiertas hendidura para estufa")
+            self.assertEqual(sheet.cell(4, price).value, 9000)
+            self.assertEqual(sheet.cell(4, fba).value, 1430)
+            self.assertEqual(sheet.cell(4, _column(sheet, "MKD链接", 1)).value, "https://www.mercadolibre.com.ar/p/MLARECT")
+            self.assertIsNone(sheet.cell(4, _column(sheet, "MKD链接", 2)).value)
+            self.assertEqual(sheet.cell(5, name).value, "圆形支架（规格）\n（4单）")
+            self.assertEqual(sheet.cell(5, sku).value, "cubiertas hendidura para estufa")
+            self.assertEqual(sheet.cell(5, price).value, 33000)
+            self.assertEqual(sheet.cell(5, fba).value, 9948)
+            self.assertEqual(sheet.cell(5, _column(sheet, "MKD链接", 1)).value, "https://www.mercadolibre.com.ar/p/MLACAP")
+            self.assertEqual(write_product_workbook(path, [product]), 3)
+            sheet = load_workbook(path)[TEMPLATE_SHEET]
+            self.assertIsNone(sheet.cell(6, 1).value)
+            product["functional_fba_fee"] = 1500
+            product["functional_market_orders"] = 9
+            product["spec_fba_fee"] = 10548
+            self.assertEqual(fill_package_rows(path, [product], replace_fba=True), 2)
+            sheet = load_workbook(path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(3, fba).value, 2740)
+            self.assertEqual(sheet.cell(4, fba).value, 1500)
+            self.assertEqual(sheet.cell(4, name).value, "圆形支架（矩形）\n（8单）")
+            self.assertEqual(sheet.cell(5, fba).value, 10548)
+            self.assertEqual(sheet.cell(5, name).value, "圆形支架（规格）\n（4单）")
 
     def test_products_without_matches_are_not_written(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

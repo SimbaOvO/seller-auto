@@ -168,6 +168,50 @@ class LingdongParseTests(unittest.TestCase):
         self.assertEqual(table_decision(before, updated, False, 0), "row")
         self.assertEqual(table_decision(before, {"loading": False, "empty": True, "rows": []}, False, 0), "empty")
 
+    def test_rectangular_variant_has_its_own_fee_and_links(self) -> None:
+        product = {
+            "package_size": {
+                "length": "33",
+                "width": "27.1",
+                "height": "8.7",
+                "unit": "cm",
+                "weight": "260",
+                "weight_unit": "g",
+            },
+            "matches": [
+                {
+                    "candidate_id": "same",
+                    "url": "https://www.mercadolibre.com.ar/p/MLA1",
+                    "sales_text": "+10 vendidos",
+                    "price": 19989,
+                    "confidence": 0.9,
+                },
+                {
+                    "candidate_id": "rect",
+                    "url": "https://www.mercadolibre.com.ar/p/MLA2",
+                    "sales_text": "+5 vendidos",
+                    "price": 8000,
+                    "confidence": 0.9,
+                    "relation": "functional",
+                },
+                {
+                    "candidate_id": "capacity",
+                    "url": "https://www.mercadolibre.com.ar/p/MLA3",
+                    "sales_text": "+2 vendidos",
+                    "price": 33000,
+                    "confidence": 0.9,
+                    "relation": "spec",
+                },
+            ],
+        }
+        self.assertEqual(apply_last_mile(product), 2820)
+        self.assertEqual(product["fba_fee"], 2820)
+        self.assertEqual(product["functional_fba_fee"], 1430)
+        self.assertEqual(product["spec_fba_fee"], 9948)
+        self.assertEqual(quote_links(product), ["https://www.mercadolibre.com.ar/p/MLA1"])
+        self.assertEqual(quote_links(product, relation="functional"), ["https://www.mercadolibre.com.ar/p/MLA2"])
+        self.assertEqual(quote_links(product, relation="spec"), ["https://www.mercadolibre.com.ar/p/MLA3"])
+
     def test_quote_links_follow_the_sheet_order(self) -> None:
         product = {
             "matches": [

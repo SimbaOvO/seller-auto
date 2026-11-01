@@ -8,6 +8,37 @@ from typing import Any
 
 TITLE_MISMATCH_REASON = "标题明显不是同一商品"
 TITLE_FILTER_MODEL = "title-filter"
+RELATION_SAME = "same"
+RELATION_FUNCTIONAL = "functional"
+RELATION_SPEC = "spec"
+VARIANT_RELATIONS = (RELATION_FUNCTIONAL, RELATION_SPEC)
+_RELATION_ALIASES = {
+    "functional": RELATION_FUNCTIONAL,
+    "rectangle": RELATION_FUNCTIONAL,
+    "rectangular": RELATION_FUNCTIONAL,
+    "矩形": RELATION_FUNCTIONAL,
+    "spec": RELATION_SPEC,
+    "capacity": RELATION_SPEC,
+    "unit": RELATION_SPEC,
+    "规格": RELATION_SPEC,
+    "容量": RELATION_SPEC,
+}
+VARIANT_ROWS = {
+    RELATION_FUNCTIONAL: {
+        "orders": "functional_market_orders",
+        "fee": "functional_fba_fee",
+        "mark": "（矩形）",
+        "fallback": "矩形相似",
+        "label": "矩形相似",
+    },
+    RELATION_SPEC: {
+        "orders": "spec_market_orders",
+        "fee": "spec_fba_fee",
+        "mark": "（规格）",
+        "fallback": "规格不同",
+        "label": "规格不同",
+    },
+}
 
 _STOPWORDS = {
     "a",
@@ -99,6 +130,51 @@ def coerce_bool(value: Any) -> bool:
     return False
 
 
+def match_relation(value: Any) -> str:
+    """同款是 same。矩形相似和规格不同各自单独成行。"""
+
+    raw = value.get("relation") if isinstance(value, dict) else value
+    return _RELATION_ALIASES.get(str(raw or "").strip().casefold(), RELATION_SAME)
+
+
+def is_variant(relation: str) -> bool:
+    return relation in VARIANT_ROWS
+
+
+def orders_field(relation: str) -> str:
+    row = VARIANT_ROWS.get(relation)
+    return str(row["orders"]) if row else "market_orders"
+
+
+def fee_field(relation: str) -> str:
+    row = VARIANT_ROWS.get(relation)
+    return str(row["fee"]) if row else "fba_fee"
+
+
+def variant_label(relation: str) -> str:
+    row = VARIANT_ROWS.get(relation)
+    return str(row["label"]) if row else ""
+
+
+def variant_name(name: str, relation: str) -> str:
+    row = VARIANT_ROWS[relation]
+    mark = str(row["mark"])
+    base = (name or "").strip()
+    if base.endswith(mark):
+        return base
+    if not base:
+        return str(row["fallback"])
+    return f"{base}{mark}"
+
+
+def separate_row_name(name: str) -> bool:
+    return any((name or "").endswith(str(row["mark"])) for row in VARIANT_ROWS.values())
+
+
+def known_orders_fields() -> set[str]:
+    return {"market_orders", *(str(row["orders"]) for row in VARIANT_ROWS.values())}
+
+
 def normalize_match(raw: Any) -> dict[str, Any]:
     if hasattr(raw, "model_dump"):
         data = raw.model_dump()
@@ -113,16 +189,21 @@ def normalize_match(raw: Any) -> dict[str, Any]:
         confidence = float(data.get("confidence") or 0)
     except (TypeError, ValueError) as exc:
         raise MatchInputError(f"{candidate_id} 的 confidence 不是数字") from exc
+    relation = match_relation(data)
+    similar = coerce_bool(data.get("similar"))
+    if is_variant(relation):
+        similar = False
     return {
         "candidate_id": candidate_id,
-        "similar": coerce_bool(data.get("similar")),
+        "similar": similar,
+        "relation": relation,
         "confidence": confidence,
         "reason": str(data.get("reason") or "").strip(),
     }
 
 
 def filter_matches(matches: list[Any], threshold: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """只保留 similar 且置信度达到阈值的判断。达到标准的全部进入后续销量筛选。"""
+    """保留同款，以及达到阈值的矩形相似和规格不同。每类各自进入销量筛选。"""
 
     if not 0 <= threshold <= 1:
         raise MatchInputError("相似度阈值必须在 0 到 1 之间")
@@ -130,7 +211,7 @@ def filter_matches(matches: list[Any], threshold: float) -> tuple[list[dict[str,
     dropped: list[dict[str, Any]] = []
     for raw in matches:
         item = normalize_match(raw)
-        if item["similar"] and item["confidence"] >= threshold:
+        if item["confidence"] >= threshold and (item["similar"] or is_variant(item["relation"])):
             kept.append(item)
         else:
             dropped.append(item)

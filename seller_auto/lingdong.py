@@ -7,6 +7,7 @@ import time
 import traceback
 from typing import Any
 
+from seller_auto.matches import RELATION_SAME, VARIANT_RELATIONS, fee_field, orders_field, variant_label
 from seller_auto.pacing import Cooldown
 from seller_auto.step_log import step
 from seller_auto.storage import public_url
@@ -210,22 +211,35 @@ def parse_ars_amount(text: str) -> int | float | None:
     return float(number)
 
 
-def apply_last_mile(product: dict[str, Any]) -> int | None:
-    """用卖家精灵的重量、长宽高，和前 10 条同款的最低售价，记下尾程运费。"""
-
+def _pool_fee(product: dict[str, Any], relation: str) -> tuple[int, float, float] | None:
     package = product.get("package_size")
     if not package_fields(package):
         return None
-    price = lowest_selling_price(ranked_matches(product))
+    price = lowest_selling_price(ranked_matches(product, relation=relation))
     if price is None:
         return None
     kilograms = chargeable_kilograms({}, package)
     fee = last_mile_fee(kilograms, price)
     if fee is None:
         return None
-    product["fba_fee"] = fee
-    step("运费", f"计费重量 {kilograms:.3f} kg，最低售价 {price:g}，尾程运费 {fee}")
-    return fee
+    return fee, kilograms, price
+
+
+def apply_last_mile(product: dict[str, Any]) -> int | None:
+    """用卖家精灵的重量、长宽高，和各自前 10 条的最低售价，记下尾程运费。"""
+
+    recorded: int | None = None
+    for relation in (RELATION_SAME, *VARIANT_RELATIONS):
+        fee = _pool_fee(product, relation)
+        if fee is None:
+            continue
+        product[fee_field(relation)] = fee[0]
+        label = variant_label(relation)
+        prefix = f"{label}计费重量" if label else "计费重量"
+        step("运费", f"{prefix} {fee[1]:.3f} kg，最低售价 {fee[2]:g}，尾程运费 {fee[0]}")
+        if recorded is None:
+            recorded = fee[0]
+    return recorded
 
 
 def last_mile_fee(weight_kg: float, price: float) -> int | None:
@@ -288,15 +302,34 @@ def link_batches(links: list[str], size: int = LINK_BATCH_SIZE) -> list[list[str
     return [cleaned[index:index + step_size] for index in range(0, len(cleaned), step_size)]
 
 
-def quote_links(product: dict[str, Any]) -> list[str]:
+def quote_links(product: dict[str, Any], relation: str | None = None) -> list[str]:
     """和表格 MKD链接 同一批：按销量倒序的前 10 条，去掉跟踪参数。"""
 
     found: list[str] = []
-    for item in ranked_matches(product):
+    for item in ranked_matches(product, relation=relation):
         url = public_url(str(item.get("url") or ""), str(item.get("key") or item.get("candidate_id") or ""))
         if url and url not in found:
             found.append(url)
     return found
+
+
+def quote_jobs(product_id: str, product: dict[str, Any]) -> list[dict[str, Any]]:
+    """同款、矩形相似和规格不同各查一批链接，单量分别写回。"""
+
+    jobs: list[dict[str, Any]] = []
+    for relation in (RELATION_SAME, *VARIANT_RELATIONS):
+        links = quote_links(product, relation=relation)
+        if not links:
+            continue
+        jobs.append(
+            {
+                "product_id": product_id,
+                "links": links,
+                "package": product.get("package_size"),
+                "orders_field": orders_field(relation),
+            }
+        )
+    return jobs
 
 
 def total_orders(rows: list[dict[str, Any]]) -> int | None:

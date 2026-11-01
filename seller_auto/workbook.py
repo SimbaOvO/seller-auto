@@ -16,6 +16,15 @@ from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
+from seller_auto.matches import (
+    RELATION_SAME,
+    VARIANT_RELATIONS,
+    fee_field,
+    match_relation,
+    orders_field,
+    separate_row_name,
+    variant_name,
+)
 from seller_auto.sales import sales_count
 from seller_auto.storage import public_url
 
@@ -92,10 +101,28 @@ def purchase_cost(product: dict[str, Any]) -> float | None:
     return float(Decimal(str(average)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def ranked_matches(product: dict[str, Any], limit: int = MKD_LINK_COUNT) -> list[dict[str, Any]]:
-    """对比记录按销量倒序，取前 10。"""
+def match_pool(product: dict[str, Any], relation: str | None = None) -> str:
+    if relation in {RELATION_SAME, *VARIANT_RELATIONS}:
+        return relation
+    sheet = product.get("sheet_relation")
+    if sheet in VARIANT_RELATIONS:
+        return str(sheet)
+    return RELATION_SAME
 
-    rows = [item for item in product.get("matches") or [] if item.get("url")]
+
+def ranked_matches(
+    product: dict[str, Any],
+    limit: int = MKD_LINK_COUNT,
+    relation: str | None = None,
+) -> list[dict[str, Any]]:
+    """对比记录按销量倒序，取前 10。同款、矩形相似和规格不同分开排。"""
+
+    pool = match_pool(product, relation)
+    rows = [
+        item
+        for item in product.get("matches") or []
+        if item.get("url") and match_relation(item) == pool
+    ]
     rows.sort(
         key=lambda item: (
             -sales_count(str(item.get("sales_text") or "")),
@@ -106,13 +133,22 @@ def ranked_matches(product: dict[str, Any], limit: int = MKD_LINK_COUNT) -> list
     return rows[:limit]
 
 
-def sales_cutoff(product: dict[str, Any], limit: int = MKD_LINK_COUNT) -> int | None:
-    """同款销量已满 limit 条时，返回第 limit 名的销量；未满则没有门槛。"""
+def sales_cutoff(
+    product: dict[str, Any],
+    limit: int = MKD_LINK_COUNT,
+    relation: str | None = None,
+) -> int | None:
+    """这一池销量已满 limit 条时，返回第 limit 名的销量；未满则没有门槛。"""
 
-    rows = [item for item in product.get("matches") or [] if item.get("url")]
+    pool = match_pool(product, relation if relation is not None else RELATION_SAME)
+    rows = [
+        item
+        for item in product.get("matches") or []
+        if item.get("url") and match_relation(item) == pool
+    ]
     if len(rows) < limit:
         return None
-    top = ranked_matches(product, limit)
+    top = ranked_matches(product, limit, relation=pool)
     if len(top) < limit:
         return None
     return sales_count(str(top[-1].get("sales_text") or ""))
@@ -124,10 +160,12 @@ def can_enter_top(
     confidence: float | None = None,
     candidate_id: str = "",
     limit: int = MKD_LINK_COUNT,
+    relation: str | None = None,
 ) -> bool:
-    """已记录同款是否挤得进销量前 10。销量相同再比相似度。"""
+    """已记录的同一池是否挤得进销量前 10。同款、矩形相似和规格不同互不挤占。"""
 
-    cutoff = sales_cutoff(product, limit)
+    pool = relation if relation in VARIANT_RELATIONS else RELATION_SAME
+    cutoff = sales_cutoff(product, limit, relation=pool)
     if cutoff is None:
         return True
     count = sales_count(sales_text)
@@ -137,7 +175,7 @@ def can_enter_top(
         return False
     if confidence is None:
         return True
-    top = ranked_matches(product, limit)
+    top = ranked_matches(product, limit, relation=pool)
     last = top[-1]
     last_confidence = float(last.get("confidence") or last.get("similarity") or 0)
     if float(confidence) > last_confidence:
@@ -207,6 +245,26 @@ def _name_key(value: Any) -> str:
     return str(value or "").split("\n", 1)[0].strip()
 
 
+def sheet_entries(product: dict[str, Any]) -> list[dict[str, Any]]:
+    """同款一行。矩形相似、规格不同再各开一行，包装和货源仍用这条亚马逊商品。"""
+
+    entries: list[dict[str, Any]] = []
+    if ranked_matches(product, limit=1, relation=RELATION_SAME):
+        entries.append(product)
+    for relation in VARIANT_RELATIONS:
+        rows = ranked_matches(product, relation=relation)
+        if not rows:
+            continue
+        clone = dict(product)
+        clone["chinese_name"] = variant_name(str(product.get("chinese_name") or ""), relation)
+        clone["matches"] = rows
+        clone["market_orders"] = product.get(orders_field(relation))
+        clone["fba_fee"] = product.get(fee_field(relation))
+        clone["sheet_relation"] = relation
+        entries.append(clone)
+    return entries
+
+
 def _find_product_row(sheet: Worksheet, roles: dict[str, int], product: dict[str, Any]) -> int | None:
     sku = (product.get("keywords") or "").strip()
     name = (product.get("chinese_name") or "").strip()
@@ -215,13 +273,20 @@ def _find_product_row(sheet: Worksheet, roles: dict[str, int], product: dict[str
     last = _next_data_row(sheet)
     sku_hits: list[int] = []
     name_hits: list[int] = []
+    named_sku_hits: list[int] = []
     for row in range(2, last):
         cell_sku = str(sheet.cell(row, sku_column).value or "").strip() if sku_column else ""
         cell_name = _name_key(sheet.cell(row, name_column).value) if name_column else ""
         if sku and cell_sku == sku:
             sku_hits.append(row)
+            if name and cell_name == name:
+                named_sku_hits.append(row)
         elif not sku and name and cell_name == name:
             name_hits.append(row)
+    if sku and name and named_sku_hits:
+        return named_sku_hits[-1]
+    if sku and separate_row_name(name):
+        return None
     if sku:
         return sku_hits[-1] if sku_hits else None
     return name_hits[-1] if name_hits else None
@@ -280,11 +345,12 @@ def fill_package_rows(path: Path, products: list[dict[str, Any]], *, replace_fba
     roles = _roles(headers)
     updated = 0
     for product in rows:
-        row = _find_product_row(sheet, roles, product)
-        if row is None:
-            continue
-        if _fill_package_cells(sheet, row, roles, product, replace_fba=replace_fba):
-            updated += 1
+        for entry in sheet_entries(product):
+            row = _find_product_row(sheet, roles, entry)
+            if row is None:
+                continue
+            if _fill_package_cells(sheet, row, roles, entry, replace_fba=replace_fba):
+                updated += 1
     if updated:
         if not os.access(path, os.W_OK):
             path.chmod(path.stat().st_mode | 0o200)
@@ -339,7 +405,9 @@ def _already_listed(
 
 
 def write_product_workbook(path: Path, products: list[dict[str, Any]], template: Path | None = None) -> int:
-    rows = [product for product in products if ranked_matches(product, limit=1)]
+    rows: list[dict[str, Any]] = []
+    for product in products:
+        rows.extend(sheet_entries(product))
     if not rows:
         return 0
     source = path if path.is_file() else (template or template_path())

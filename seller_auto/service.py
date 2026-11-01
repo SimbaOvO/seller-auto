@@ -25,13 +25,20 @@ from seller_auto.browser import NEEDS_HUMAN, ArgentinaBrowser, browser_closed_er
 from seller_auto.browser_launch import playwright_install_command
 from seller_auto.categories import category_reason, classify_breadcrumb
 from seller_auto.images import save_original, to_client_jpeg
-from seller_auto.lingdong import LingdongLoginSkipped, apply_last_mile, collect_market_quotes, quote_links
+from seller_auto.lingdong import LingdongLoginSkipped, apply_last_mile, collect_market_quotes, quote_jobs
 from seller_auto.matches import (
+    RELATION_FUNCTIONAL,
+    RELATION_SPEC,
     TITLE_FILTER_MODEL,
     TITLE_MISMATCH_REASON,
+    VARIANT_RELATIONS,
     MatchInputError,
     filter_matches,
+    is_variant,
+    known_orders_fields,
+    match_relation,
     title_obviously_different,
+    variant_label,
 )
 from seller_auto.mercadolibre import (
     collect_ad_cards,
@@ -662,16 +669,10 @@ class SellerAutoService:
             jobs = []
             for product_id in export_ids:
                 product = (state.get("products") or {}).get(product_id) or {}
-                links = quote_links(product)
-                if not links:
-                    continue
-                jobs.append(
-                    {
-                        "product_id": product_id,
-                        "links": list(links),
-                        "package": copy.deepcopy(product.get("package_size")),
-                    }
-                )
+                for job in quote_jobs(product_id, product):
+                    job["links"] = list(job["links"])
+                    job["package"] = copy.deepcopy(product.get("package_size"))
+                    jobs.append(job)
         if not jobs:
             return ""
         try:
@@ -720,6 +721,19 @@ class SellerAutoService:
             message = f"{message} {market_note}"
         if freight_note:
             message = f"{message} {freight_note}"
+        if written:
+            notes = []
+            relations = {
+                match_relation(item)
+                for product in products
+                for item in product.get("matches") or []
+            }
+            if RELATION_FUNCTIONAL in relations:
+                notes.append("矩形相似已另开一行。")
+            if RELATION_SPEC in relations:
+                notes.append("规格不同已另开一行。")
+            if notes:
+                message = f"{message} {' '.join(notes)}"
         return message, str(path), str(workbook_path)
 
     def _record_last_mile(self, export_ids: list[str]) -> str:
@@ -989,7 +1003,10 @@ class SellerAutoService:
                     product = (state.get("products") or {}).get(job["product_id"])
                     if not product or quote.get("orders") is None:
                         continue
-                    product["market_orders"] = quote["orders"]
+                    field = str(job.get("orders_field") or "market_orders")
+                    if field not in known_orders_fields():
+                        field = "market_orders"
+                    product[field] = quote["orders"]
                     wrote = True
                 if wrote:
                     self._commit_locked()
@@ -1418,6 +1435,7 @@ class SellerAutoService:
                 continue
             candidate["similarity"] = item["confidence"]
             candidate["similar"] = item["similar"]
+            candidate["relation"] = item["relation"]
             candidate["reason"] = item["reason"]
             candidate["model_name"] = model_name
             self._remember_judged(product, item["candidate_id"])
@@ -1438,7 +1456,8 @@ class SellerAutoService:
                 pool.extend(match.get("ad_candidates") or [])
         items = []
         for candidate in pool:
-            if not candidate.get("similar"):
+            relation = match_relation(candidate)
+            if not is_variant(relation) and not candidate.get("similar"):
                 continue
             try:
                 confidence = float(candidate.get("similarity") or 0)
@@ -1451,7 +1470,8 @@ class SellerAutoService:
             items.append(
                 {
                     "candidate_id": candidate["candidate_id"],
-                    "similar": True,
+                    "similar": not is_variant(relation),
+                    "relation": relation,
                     "confidence": confidence,
                     "reason": candidate.get("reason") or "",
                 }
@@ -1565,7 +1585,7 @@ class SellerAutoService:
                 images,
             )
         for match in product["matches"]:
-            if match.get("source") != "search" or match.get("ads_complete"):
+            if match.get("source") != "search" or match.get("ads_complete") or is_variant(match_relation(match)):
                 continue
             if not match.get("ads_scraped"):
                 blocked = self._scrape_ad_match(product, match)
@@ -1660,6 +1680,8 @@ class SellerAutoService:
         for match in product.get("matches") or []:
             if match.get("source") != "search" or match.get("ads_complete") or match.get("ads_scraped"):
                 continue
+            if is_variant(match_relation(match)):
+                continue
             return match
         return None
 
@@ -1705,6 +1727,7 @@ class SellerAutoService:
             sales_text,
             confidence=confidence,
             candidate_id=str(item.get("candidate_id") or ""),
+            relation=match_relation(item),
         )
 
     def _open_judged_matches(
@@ -1728,6 +1751,7 @@ class SellerAutoService:
                     continue
                 candidate["similarity"] = item["confidence"]
                 candidate["similar"] = item["similar"]
+                candidate["relation"] = item["relation"]
                 candidate["reason"] = item["reason"]
                 candidate["model_name"] = model_name
                 self._remember_judged(product, item["candidate_id"])
@@ -1738,9 +1762,16 @@ class SellerAutoService:
                 continue
             record_from_card = False
             card_text = str(candidate.get("sales_text") or "")
+            variant = is_variant(match_relation(item))
             with self._state_lock:
                 if candidate["key"] in product["checked_keys"]:
                     skipped.append(candidate["candidate_id"])
+                    continue
+                if variant and not has_sales(card_text):
+                    product["checked_keys"].append(candidate["key"])
+                    skipped.append(candidate["candidate_id"])
+                    self._commit_locked()
+                    step("销量", f"卡片没有 vendido，不打开详情 {public_url(candidate['url'])}")
                     continue
                 if has_sales(card_text) and not self._fits_top(product, card_text, item):
                     product["checked_keys"].append(candidate["key"])
@@ -1748,7 +1779,7 @@ class SellerAutoService:
                     self._commit_locked()
                     step("销量", f"卡片销量挤不进前10，跳过 {card_text} {public_url(candidate['url'])}")
                     continue
-                record_from_card = source == "recommendation" and has_sales(card_text)
+                record_from_card = variant or (source == "recommendation" and has_sales(card_text))
             if record_from_card:
                 if not candidate.get("image_path"):
                     self._ensure_candidate_files([candidate], page_url=str(candidate.get("url") or ""))
@@ -1766,7 +1797,8 @@ class SellerAutoService:
                     )
                     recorded.append(product["matches"][-1])
                     self._commit_locked()
-                step("销量", f"广告卡片已有销量，不打开详情 {card_text} {public_url(candidate['url'])}")
+                note = "不打开详情，也不抓广告 " if variant else "不打开详情 "
+                step("销量", f"卡片已有销量，{note}{_sale_note(item)}{card_text} {public_url(candidate['url'])}")
                 continue
             browser = self._ensure_browser()
             browser.ml_cooldown.acquire()
@@ -1819,7 +1851,7 @@ class SellerAutoService:
                 self._commit_locked()
             if source == "search":
                 self._fill_listing_ads(product, saved_match, page)
-            step("销量", f"有销量，已记录 {sales['sales_text']} {public_url(candidate['url'])}")
+            step("销量", f"有销量，已记录 {_sale_note(item)}{sales['sales_text']} {public_url(candidate['url'])}")
             browser.close_detail()
         self._save()
         return self._payload(
@@ -1862,6 +1894,7 @@ class SellerAutoService:
                 "price": price if price is not None else candidate.get("price"),
                 "confidence": item["confidence"],
                 "reason": item["reason"],
+                "relation": match_relation(item),
                 "source": source,
                 "parent_url": parent,
                 "image_path": image_path,
@@ -1869,8 +1902,8 @@ class SellerAutoService:
                 "candidate_id": candidate["candidate_id"],
                 "ad_candidates": [],
                 "ad_next_index": 0,
-                "ads_scraped": source != "search",
-                "ads_complete": source != "search",
+                "ads_scraped": source != "search" or is_variant(match_relation(item)),
+                "ads_complete": source != "search" or is_variant(match_relation(item)),
             }
         )
 
@@ -2114,6 +2147,12 @@ class SellerAutoService:
             "先对照亚马逊标题。标题已经能明显看出不是同一商品的，直接记 similar=false、confidence=1，不要再看图。"
             "标题对得上的，看本批已经返回的图。包装、折叠、带脚整机、生活场景、只拍局部、装套演示等构图已经明显不同的，记 similar=false。"
             "颜色不同也可以算同款。外形、结构和整体构图高度相似则为 true，外形明显不同则为 false。"
+            "亚马逊主图是圆形支架、候选是矩形，构图不同但用途和功能相同，相似度不低于 0.8 时，"
+            "不要记成同款：similar=false，relation 填 functional，confidence 填相似度。"
+            "容量、重量、尺寸、体积、功率这类单位对不上，但整体用途相同，相似度不低于 0.8 时，"
+            "也不要记成同款：similar=false，relation 填 spec，confidence 填相似度。"
+            "这两类只看卡片：已经写了 vendidos 的直接记录并走表格，不打开详情，也不访问广告位；卡片没有销量的不记录。"
+            "其他外形不同的不要填 functional 或 spec。"
             f"判断完调用 {submit}，model_name 填当前模型名。"
         )
 
@@ -2295,6 +2334,7 @@ class SellerAutoService:
             "title": match.get("title") or "",
             "sales_text": match.get("sales_text") or "",
             "confidence": match.get("confidence"),
+            "relation": match_relation(match),
             "source": match.get("source"),
             "parent_url": match.get("parent_url"),
             "model_name": match.get("model_name") or "",
@@ -2342,8 +2382,16 @@ def _replay_ad_batch(product: dict[str, Any]) -> tuple[dict[str, Any], list[dict
     return None
 
 
+def _sale_note(item: dict[str, Any]) -> str:
+    label = variant_label(match_relation(item))
+    return f"{label} " if label else ""
+
+
 def _top_links(product: dict[str, Any]) -> list[dict[str, Any]]:
-    return similarity_rows(product)[:10]
+    rows = similarity_rows(product)[:10]
+    for relation in VARIANT_RELATIONS:
+        rows.extend(similarity_rows(product, relation=relation)[:10])
+    return rows
 
 
 def _jpeg_file(path: str) -> bytes | None:
