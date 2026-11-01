@@ -58,6 +58,9 @@ class LaunchMcpTests(unittest.TestCase):
             )
         self.assertEqual(code, 0)
         self.assertEqual(opened.call_args.kwargs["creationflags"], flags)
+        self.assertIs(opened.call_args.kwargs["stdin"], launch_mcp.sys.stdin)
+        self.assertIs(opened.call_args.kwargs["stdout"], launch_mcp.sys.stdout)
+        self.assertIs(opened.call_args.kwargs["stderr"], stderr)
         self.assertIn("5", stderr.write.call_args.args[0])
         kernel.CloseHandle.assert_called_once_with(7)
 

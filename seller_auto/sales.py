@@ -9,9 +9,24 @@ _COUNT = re.compile(r"\+?\s*(\d[\d.]*)\s*vendidos?", re.IGNORECASE)
 
 
 def has_sales(text: str) -> bool:
-    """有 “vendido” 或 “vendidos” 才算有销量。"""
+    """有 “vendido” 或 “vendidos” 才算有销量。卖家信誉上的 “ventas” 不算。"""
 
     return _SOLD.search(text or "") is not None
+
+
+def pick_sales_line(*texts: str) -> str:
+    """从标题旁边的几段文字里挑出商品销量。短句优先，长文只抽出 vendido 那一段。"""
+
+    cleaned = [" ".join((text or "").split()) for text in texts]
+    cleaned = [text for text in cleaned if text]
+    for text in cleaned:
+        if has_sales(text) and len(text) <= 80:
+            return text
+    for text in cleaned:
+        match = _COUNT.search(text)
+        if match:
+            return match.group(0).strip()
+    return ""
 
 
 def sales_count(text: str) -> int:

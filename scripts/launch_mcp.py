@@ -47,9 +47,14 @@ def _wait_on_windows(argv: list[str]) -> int:
     import ctypes
 
     job = _windows_kill_on_close_job()
-    # 标准输入输出继续继承。CREATE_NO_WINDOW 避免再弹出一个控制台。
+    # Python 3.7 起 close_fds 在 Windows 上默认是 True，不显式传入标准流时
+    # 子进程不会继承 Cursor 的管道，初始化消息没人读，客户端会一直停在 connecting。
+    # CREATE_NO_WINDOW 避免再弹出一个控制台。
     process = subprocess.Popen(
         argv,
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
     )
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

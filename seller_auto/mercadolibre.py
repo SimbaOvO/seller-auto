@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from seller_auto.sales import has_sales
+from seller_auto.sales import has_sales, pick_sales_line
 from seller_auto.urls import absolute_amazon_url, ml_item_key, ml_page2_url
 
 SALES_SELECTOR = (
@@ -109,11 +109,48 @@ CARD_SCRIPT = """
 """
 
 
+HEADER_SALES_SCRIPT = """
+() => {
+  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const selectors = [
+    ".ui-pdp-header__subtitle",
+    ".ui-pdp-subtitle",
+    ".ui-pdp-header span",
+    ".ui-pdp-header p",
+  ];
+  const found = [];
+  for (const selector of selectors) {
+    for (const el of document.querySelectorAll(selector)) {
+      const text = clean(el.innerText || el.textContent);
+      if (text && text.length <= 120) found.push(text);
+    }
+  }
+  const header = document.querySelector(".ui-pdp-header");
+  if (header) found.push(clean(header.innerText).slice(0, 400));
+  return found;
+}
+"""
+
+
 def read_sales_text(page: Any) -> str:
-    specific = page.locator(SALES_SELECTOR)
-    if specific.count() > 0:
-        return _text(specific)
-    return _text(page.locator("div.ui-pdp-header__subtitle"))
+    """标题旁的「Nuevo | 1 vendido」就是销量。不再只认旧版 div 字幕。"""
+
+    texts: list[str] = []
+    for selector in (SALES_SELECTOR, ".ui-pdp-header__subtitle", ".ui-pdp-subtitle"):
+        locator = page.locator(selector)
+        try:
+            count = min(locator.count(), 3)
+        except Exception:
+            count = 0
+        for index in range(count):
+            texts.append(_text(locator.nth(index)))
+    try:
+        extra = page.evaluate(HEADER_SALES_SCRIPT)
+    except Exception:
+        extra = []
+    if isinstance(extra, list):
+        texts.extend(str(item) for item in extra)
+    return pick_sales_line(*texts)
 
 
 def sales_from_text(text: str) -> dict[str, Any]:
