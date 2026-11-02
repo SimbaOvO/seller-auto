@@ -1,4 +1,4 @@
-"""往 test.xlsx「第一批产品」后面追加一行，不另存新表。"""
+"""按店铺 id 写入表格。模板只留表头，公式和底色从 test.xlsx 抽出来继续用。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, PatternFill
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
-from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.utils import column_index_from_string, coordinate_to_tuple, get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from seller_auto.matches import (
@@ -29,6 +29,8 @@ from seller_auto.sales import sales_count
 from seller_auto.storage import public_url
 
 TEMPLATE_SHEET = "第一批产品"
+STYLE_SHEET = "_样式"
+_PRODUCT_SHEETS = ("第一批产品", "新开产品", "暂不做产品")
 EXCHANGE_RATE = 0.004
 CHANNEL_RATE = 0.15
 MKD_LINK_COUNT = 10
@@ -60,7 +62,149 @@ _CONSTANTS = {
 
 
 def template_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "test.xlsx"
+    return Path(__file__).resolve().parent.parent / "template.xlsx"
+
+
+def source_workbook_path() -> Path:
+    return template_path().with_name("test.xlsx")
+
+
+def seller_workbook_path(seller_id: str, directory: Path | None = None) -> Path:
+    """店铺表格用店铺 id 做文件名，和模板放在同一目录。"""
+
+    folder = directory or template_path().parent
+    token = re.sub(r"[^A-Za-z0-9_-]", "", str(seller_id or ""))
+    if not token:
+        raise ValueError("店铺 id 为空")
+    return folder / f"{token}.xlsx"
+
+
+def ensure_template(source: Path | None = None) -> Path:
+    """没有干净模板时，从 test.xlsx 抽一份只留表头的模板。"""
+
+    path = template_path()
+    if path.is_file():
+        return path
+    origin = source or source_workbook_path()
+    if not origin.is_file():
+        return path
+    return build_clean_template(origin, path)
+
+
+def build_clean_template(source: Path, destination: Path) -> Path:
+    """保留表头、列宽、公式和底色，清掉表头下面的数据行和图片。"""
+
+    workbook = load_workbook(source)
+    if TEMPLATE_SHEET not in workbook.sheetnames:
+        raise ValueError(f"模板里没有「{TEMPLATE_SHEET}」")
+    prototype = _capture_prototype(workbook[TEMPLATE_SHEET])
+    column_rules = _column_format_rules(workbook[TEMPLATE_SHEET])
+    for name in _PRODUCT_SHEETS:
+        if name not in workbook.sheetnames:
+            continue
+        _clear_sheet_body(workbook[name])
+        _restore_column_formats(workbook[name], column_rules)
+    _write_style_sheet(workbook, prototype)
+    if TEMPLATE_SHEET in workbook.sheetnames:
+        workbook.active = workbook[TEMPLATE_SHEET]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(destination)
+    return destination
+
+
+def _style_sheet(workbook: Any) -> Worksheet | None:
+    if STYLE_SHEET in getattr(workbook, "sheetnames", ()):
+        return workbook[STYLE_SHEET]
+    return None
+
+
+def _capture_prototype(sheet: Worksheet) -> list[dict[str, Any]]:
+    """第一行数据上的公式、底色和数字格式。商品名称和链接不带走。"""
+
+    if sheet.max_row < 2:
+        return []
+    headers = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    captured: list[dict[str, Any]] = []
+    for column, header in enumerate(headers, start=1):
+        if header in (None, ""):
+            continue
+        cell = sheet.cell(2, column)
+        value = cell.value if isinstance(cell.value, str) and cell.value.startswith("=") else None
+        if isinstance(value, str) and "DISPIMG" in value:
+            value = None
+        captured.append(
+            {
+                "column": column,
+                "value": value,
+                "font": copy(cell.font),
+                "fill": copy(cell.fill),
+                "border": copy(cell.border),
+                "alignment": copy(cell.alignment),
+                "number_format": cell.number_format,
+            }
+        )
+    return captured
+
+
+def _column_format_rules(sheet: Worksheet) -> list[tuple[str, Any]]:
+    found: list[tuple[str, Any]] = []
+    for cf_range, rules in sheet.conditional_formatting._cf_rules.items():
+        ref = str(cf_range.sqref)
+        if "1048576" not in ref:
+            continue
+        for rule in rules:
+            found.append((ref, copy(rule)))
+    return found
+
+
+def _restore_column_formats(sheet: Worksheet, rules: list[tuple[str, Any]]) -> None:
+    current = sheet.conditional_formatting._cf_rules
+    for cf_range in list(current):
+        if "1048576" not in str(cf_range.sqref):
+            del current[cf_range]
+    if any("1048576" in str(cf_range.sqref) for cf_range in current):
+        return
+    for ref, rule in rules:
+        sheet.conditional_formatting.add(ref, copy(rule))
+
+
+def _clear_sheet_body(sheet: Worksheet) -> None:
+    sheet._images = []
+    frozen = sheet.freeze_panes
+    if sheet.max_row > 1:
+        sheet.delete_rows(2, sheet.max_row - 1)
+    for index in list(sheet.row_dimensions):
+        if index > 1:
+            del sheet.row_dimensions[index]
+    last_header = 1
+    for cell in list(sheet[1]):
+        if cell.value not in (None, ""):
+            last_header = cell.column
+    if sheet.max_column > last_header:
+        sheet.delete_cols(last_header + 1, sheet.max_column - last_header)
+    if not frozen:
+        return
+    _row, column = coordinate_to_tuple(frozen)
+    sheet.freeze_panes = f"{get_column_letter(column)}2" if column > 1 else "A2"
+    for selection in sheet.sheet_view.selection or []:
+        selection.activeCell = "A1"
+        selection.sqref = "A1"
+
+
+def _write_style_sheet(workbook: Any, prototype: list[dict[str, Any]]) -> None:
+    if STYLE_SHEET in workbook.sheetnames:
+        del workbook[STYLE_SHEET]
+    if not prototype:
+        return
+    sheet = workbook.create_sheet(STYLE_SHEET)
+    sheet.sheet_state = "hidden"
+    for item in prototype:
+        cell = sheet.cell(2, item["column"], item["value"])
+        cell.font = item["font"]
+        cell.fill = item["fill"]
+        cell.border = item["border"]
+        cell.alignment = item["alignment"]
+        cell.number_format = item["number_format"]
 
 
 def weight_kg(package: dict[str, Any] | None) -> float | None:
@@ -420,7 +564,7 @@ def write_product_workbook(path: Path, products: list[dict[str, Any]], template:
         rows.extend(sheet_entries(product))
     if not rows:
         return 0
-    source = path if path.is_file() else (template or template_path())
+    source = path if path.is_file() else (template or ensure_template())
     workbook = load_workbook(source)
     sheet = workbook[TEMPLATE_SHEET]
     mkd_columns = _ensure_mkd_columns(sheet)
@@ -474,6 +618,10 @@ def _ensure_mkd_columns(sheet: Worksheet, count: int = MKD_LINK_COUNT) -> list[i
     missing = count - len(columns)
     sheet.insert_cols(insert_at, amount=missing)
     _shift_formula_columns(sheet, insert_at, missing)
+    style = _style_sheet(sheet.parent)
+    if style is not None:
+        style.insert_cols(insert_at, amount=missing)
+        _shift_formula_columns(style, insert_at, missing)
     sample_width = sheet.column_dimensions[get_column_letter(columns[0])].width if columns else 13
     for offset in range(missing):
         column = insert_at + offset
@@ -639,7 +787,7 @@ def _write_row(
     for role, column in roles.items():
         # 代扣代缴后续统一 19%，不沿用表里改过的 0.23。
         if role != "withhold":
-            copied = _copied_formula(sheet, source_row, row, column)
+            copied = _copied_formula(sheet, source_row, row, column) or _prototype_formula(sheet, row, column)
             if copied:
                 sheet.cell(row, column, copied)
                 continue
@@ -660,6 +808,8 @@ def _write_row(
             continue
         sheet.cell(row, column, value)
     _style_filled_columns(sheet, source_row, row, roles)
+    for column in list(roles.values()) + list(mkd_columns):
+        _apply_prototype_format(sheet, row, column)
     for column, match in zip(mkd_columns, top):
         url = public_url(str(match.get("url") or ""), str(match.get("key") or match.get("candidate_id") or ""))
         if url:
@@ -680,9 +830,33 @@ def _center_row(sheet: Worksheet, row: int, roles: dict[str, int], mkd_columns: 
         )
 
 
+def _prototype_formula(sheet: Worksheet, row: int, column: int) -> str:
+    style = _style_sheet(sheet.parent)
+    if style is None:
+        return ""
+    value = style.cell(2, column).value
+    if not (isinstance(value, str) and value.startswith("=")):
+        return ""
+    return _retarget_formula(value, 2, row)
+
+
+def _apply_prototype_format(sheet: Worksheet, row: int, column: int) -> None:
+    style = _style_sheet(sheet.parent)
+    if style is None:
+        return
+    number_format = style.cell(2, column).number_format
+    if number_format and number_format != "General":
+        sheet.cell(row, column).number_format = number_format
+
+
 def _earlier_fill(sheet: Worksheet, row: int, column: int):
     for source in range(row - 1, 1, -1):
         fill = sheet.cell(source, column).fill
+        if fill and fill.patternType:
+            return fill
+    style = _style_sheet(sheet.parent)
+    if style is not None:
+        fill = style.cell(2, column).fill
         if fill and fill.patternType:
             return fill
     return None

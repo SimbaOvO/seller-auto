@@ -72,8 +72,7 @@ def _handle_connection(connection: socket.socket, service: SellerAutoService, wo
             except OSError:
                 return
             return
-        # 这几步会阻塞到同款详情和写表结束。判断有自己的锁，同一次等待会合并。
-        # 占着工作锁的话，超时后的重试进不来，本来那次的结果就留在已经断开的连接上。
+        # 提交马上返回。session_status 最多等大约一分半，不能占工作锁。
         if method in {"session_status", "submit_listing_matches", "submit_ad_matches"}:
             _run_tool(connection, service, method, request.get("params") or {})
             return

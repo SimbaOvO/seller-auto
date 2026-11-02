@@ -93,10 +93,17 @@ class DispatchTests(unittest.TestCase):
             service._drain_sales = fake_drain
             service._start_export = fake_export
             service.background_wait_seconds = 3
-            payload = service.submit_listing_matches(
+            submitted = service.submit_listing_matches(
                 [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
                 "cursor-grok-4.5-low-fast",
             )
+            if submitted.data["status"] != "finished":
+                self.assertEqual(submitted.data["status"], "sales_started")
+                self.assertIn("不要重复提交", submitted.data["message"])
+                service._worker.call(lambda: None)
+                payload = service.session_status()
+            else:
+                payload = submitted
             self.assertEqual(payload.data["status"], "finished")
             self.assertEqual(payload.data["next_step"], "done")
             self.assertIn("不要再调用 export_results", payload.data["message"])
@@ -160,7 +167,10 @@ class DispatchTests(unittest.TestCase):
             service.state = state
             service._save()
 
+            release = threading.Event()
+
             def fake_drain() -> None:
+                self.assertTrue(release.wait(timeout=2))
                 with service._state_lock:
                     product = service.state["products"]["B07LCLQ47D"]
                     product["sales_running"] = False
@@ -173,10 +183,15 @@ class DispatchTests(unittest.TestCase):
             service._next_amazon_product = lambda: service._payload(
                 {"ok": True, "status": "amazon_product", "product_id": "B0NEXT", "message": "旧提示"}
             )
-            payload = service.submit_listing_matches(
+            submitted = service.submit_listing_matches(
                 [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
                 "cursor-grok-4.5-low-fast",
             )
+            self.assertEqual(submitted.data["status"], "sales_started")
+            self.assertIn("不要重复提交", submitted.data["message"])
+            release.set()
+            service._worker.call(lambda: None)
+            payload = service.session_status()
             self.assertEqual(payload.data["status"], "amazon_product")
             self.assertEqual(payload.data["product_id"], "B0NEXT")
             self.assertIn("不要调用 export_results", payload.data["message"])
@@ -212,7 +227,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(match["url"].endswith("MLA-1"), True)
         self.assertEqual(batch[0]["candidate_id"], "ad1")
 
-    def test_submit_blocks_until_details_finish(self) -> None:
+    def test_submit_returns_while_details_are_still_opening(self) -> None:
         release = threading.Event()
         started = threading.Event()
         with tempfile.TemporaryDirectory() as directory:
@@ -234,26 +249,27 @@ class DispatchTests(unittest.TestCase):
                     service._commit_locked()
 
             service._drain_sales = fake_drain
-            result: dict[str, object] = {}
-
-            def call() -> None:
-                result["payload"] = service.submit_listing_matches(
-                    [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
-                    "cursor-grok-4.5-low-fast",
-                )
-
-            thread = threading.Thread(target=call)
-            thread.start()
+            started_at = time.monotonic()
+            payload = service.submit_listing_matches(
+                [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
+                "cursor-grok-4.5-low-fast",
+            )
+            self.assertLess(time.monotonic() - started_at, 1)
             self.assertTrue(started.wait(timeout=2))
-            time.sleep(0.3)
-            self.assertTrue(thread.is_alive())
+            self.assertEqual(payload.data["status"], "sales_started")
+            self.assertIn("session_status", payload.data["message"])
+            self.assertIn("不要重复提交", payload.data["message"])
+            again = service.submit_listing_matches(
+                [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
+                "cursor-grok-4.5-low-fast",
+            )
+            self.assertLess(time.monotonic() - started_at, 1)
+            self.assertEqual(again.data["status"], "sales_started")
+            self.assertIn("不要重复提交", again.data["message"])
             release.set()
-            thread.join(timeout=3)
-            self.assertFalse(thread.is_alive())
-            payload = result["payload"]
-            assert hasattr(payload, "data")
-            self.assertEqual(payload.data["status"], "finished")
-            self.assertNotIn("还在打开", payload.data["message"])
+            service._worker.call(lambda: None)
+            finished = service.session_status()
+            self.assertEqual(finished.data["status"], "finished")
 
     def test_session_status_waits_until_details_finish(self) -> None:
         release = threading.Event()
@@ -501,7 +517,7 @@ class DispatchTests(unittest.TestCase):
             assert hasattr(payload, "data")
             self.assertIn("next_amazon_product", payload.data["message"])
 
-    def test_retry_submit_joins_the_open_detail_wait(self) -> None:
+    def test_retry_submit_does_not_join_the_detail_wait(self) -> None:
         release = threading.Event()
         started = threading.Event()
         exports: list[int] = []
@@ -524,28 +540,21 @@ class DispatchTests(unittest.TestCase):
 
             service._drain_sales = fake_drain
             service._start_export = lambda: exports.append(1)
-            results: list[str] = []
             matches = [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}]
-
-            def call() -> None:
-                results.append(service.submit_listing_matches(matches, "cursor-grok-4.5-low-fast").data["status"])
-
-            first = threading.Thread(target=call)
-            second = threading.Thread(target=call)
-            first.start()
+            first = service.submit_listing_matches(matches, "cursor-grok-4.5-low-fast")
             self.assertTrue(started.wait(timeout=2))
-            second.start()
-            time.sleep(0.2)
+            second = service.submit_listing_matches(matches, "cursor-grok-4.5-low-fast")
+            self.assertEqual(first.data["status"], "sales_started")
+            self.assertEqual(second.data["status"], "sales_started")
+            self.assertEqual(exports, [])
             release.set()
-            first.join(timeout=3)
-            second.join(timeout=3)
-            self.assertFalse(first.is_alive())
-            self.assertFalse(second.is_alive())
+            service._worker.call(lambda: None)
+            finished = service.session_status()
             self.assertEqual(exports, [1])
-            self.assertEqual(results, ["finished", "finished"])
+            self.assertEqual(finished.data["status"], "finished")
 
-    def test_submit_waits_until_the_sheet_is_written(self) -> None:
-        started = threading.Event()
+    def test_submit_does_not_wait_for_the_sheet(self) -> None:
+        release = threading.Event()
         with tempfile.TemporaryDirectory() as directory:
             service = SellerAutoService(DelaySettings(), output_dir=directory)
             state = _state()
@@ -555,50 +564,25 @@ class DispatchTests(unittest.TestCase):
             service.background_wait_seconds = 5
 
             def fake_drain() -> None:
+                self.assertTrue(release.wait(timeout=2))
                 with service._state_lock:
                     product = service.state["products"]["B07LCLQ47D"]
                     product["sales_running"] = False
                     product["sales_pending"] = False
                     service._commit_locked()
 
-            def fake_export() -> None:
-                with service._state_lock:
-                    service.state["export_pending"] = True
-                    service.state["export_running"] = True
-                    service._commit_locked()
-                started.set()
-
             service._drain_sales = fake_drain
-            service._start_export = fake_export
-            result: dict[str, object] = {}
-
-            def call() -> None:
-                result["payload"] = service.submit_listing_matches(
-                    [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
-                    "cursor-grok-4.5-low-fast",
-                )
-
-            thread = threading.Thread(target=call)
-            thread.start()
-            self.assertTrue(started.wait(timeout=2))
-            time.sleep(0.2)
-            self.assertTrue(thread.is_alive())
-            with service._state_lock:
-                service.state["export_pending"] = False
-                service.state["export_running"] = False
-                service.state["products"]["B07LCLQ47D"]["workbook_written"] = True
-                service.state["export_result"] = {
-                    "message": "这一条商品的结果已追加到 book。不要再调用 next_amazon_product。",
-                    "product_id": "B07LCLQ47D",
-                }
-                service._commit_locked()
-            thread.join(timeout=3)
-            self.assertFalse(thread.is_alive())
-            payload = result["payload"]
-            assert hasattr(payload, "data")
-            self.assertEqual(payload.data["status"], "finished")
-            self.assertIn("已追加到 book", payload.data["message"])
-            self.assertIn("不要再调用 export_results", payload.data["message"])
+            service._start_export = lambda: (_ for _ in ()).throw(AssertionError("提交不该等写表"))
+            started_at = time.monotonic()
+            payload = service.submit_listing_matches(
+                [{"candidate_id": "c1", "similar": True, "confidence": 0.91, "reason": "同款"}],
+                "cursor-grok-4.5-low-fast",
+            )
+            self.assertLess(time.monotonic() - started_at, 1)
+            self.assertEqual(payload.data["status"], "sales_started")
+            self.assertIn("不要重复提交", payload.data["message"])
+            release.set()
+            service._worker.call(lambda: None)
 
 
 if __name__ == "__main__":

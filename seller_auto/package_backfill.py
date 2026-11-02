@@ -15,7 +15,7 @@ from seller_auto.sellersprite import open_1688_from_row, open_competitor
 from seller_auto.sourcing import read_page_source
 from seller_auto.step_log import step
 from seller_auto.storage import atomic_write_json
-from seller_auto.workbook import fill_package_rows, sheet_entries, template_path
+from seller_auto.workbook import fill_package_rows, seller_workbook_path, sheet_entries, template_path
 
 
 def package_incomplete(package: Any) -> bool:
@@ -169,9 +169,11 @@ def backfill_packages(
 def run(state_path: Path, workbook: Path | None = None) -> dict[str, Any]:
     settings = DelaySettings.from_argv()
     state = json.loads(state_path.read_text(encoding="utf-8"))
+    seller_id = str(state.get("seller_id") or "")
+    default_workbook = seller_workbook_path(seller_id) if seller_id else template_path()
     result = backfill_packages(
         state,
-        workbook_path=workbook or template_path(),
+        workbook_path=workbook or default_workbook,
         settings=settings,
         profile_dir=Path(settings.profile_dir),
     )

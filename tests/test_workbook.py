@@ -5,17 +5,22 @@ import unittest
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
 
 from seller_auto.workbook import (
+    STYLE_SHEET,
     TEMPLATE_SHEET,
+    build_clean_template,
     can_enter_top,
     dimension_cm,
     fill_package_rows,
     lowest_selling_price,
     ranked_matches,
     sales_cutoff,
+    seller_workbook_path,
     template_path,
     weight_kg,
     write_product_workbook,
@@ -454,8 +459,82 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(sheet.cell(2, _column(sheet, "毛重")).value, 0.204)
             self.assertEqual(sheet.cell(3, _column(sheet, "毛重")).value, 9)
 
-    def test_template_file_is_still_the_working_sheet(self) -> None:
-        self.assertEqual(template_path().name, "test.xlsx")
+    def test_template_file_is_the_clean_sheet(self) -> None:
+        self.assertEqual(template_path().name, "template.xlsx")
+
+    def test_clean_template_keeps_header_style_and_seller_file_is_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "test.xlsx"
+            image_path = Path(directory) / "hero.jpg"
+            PILImage.new("RGB", (40, 40), (20, 20, 20)).save(image_path, "JPEG")
+            _mini_workbook(source)
+            workbook = load_workbook(source)
+            sheet = workbook[TEMPLATE_SHEET]
+            sheet.cell(1, 1).fill = PatternFill(fill_type="solid", fgColor="33CCCC")
+            sheet.column_dimensions["A"].width = 22
+            yellow = PatternFill(fill_type="solid", fgColor="FFFF00")
+            cost = _column(sheet, "采购成本")
+            volume = _column(sheet, "体积")
+            margin = _column(sheet, "毛利率")
+            fee = _column(sheet, "渠道费用")
+            rate = get_column_letter(_column(sheet, "渠道比例"))
+            price = get_column_letter(_column(sheet, "销售价格"))
+            custom = f"={rate}2*{price}2+1"
+            sheet.cell(2, cost).fill = yellow
+            sheet.cell(2, volume, "=E2*F2*G2/1000000")
+            sheet.cell(2, margin, "=Z2/X2")
+            sheet.cell(2, margin).number_format = "0.00%"
+            sheet.cell(2, fee, custom)
+            sheet.add_image(ExcelImage(str(image_path)))
+            opened = workbook.create_sheet("新开产品")
+            opened.cell(1, 1, "名称")
+            opened.cell(2, 1, "不应留下")
+            notes = workbook.create_sheet("公司注册")
+            notes.cell(1, 1, "公司形式")
+            notes.cell(2, 1, "SAS")
+            workbook.save(source)
+
+            template = Path(directory) / "template.xlsx"
+            build_clean_template(source, template)
+            saved = load_workbook(template)
+            body = saved[TEMPLATE_SHEET]
+            self.assertEqual(body.cell(1, 1).value, "名称")
+            self.assertTrue(str(body.cell(1, 1).fill.fgColor.rgb).endswith("33CCCC"))
+            self.assertEqual(body.max_row, 1)
+            self.assertEqual(body.column_dimensions["A"].width, 22)
+            self.assertEqual(len(body._images), 0)
+            self.assertIsNone(saved["新开产品"].cell(2, 1).value)
+            self.assertEqual(saved["公司注册"].cell(2, 1).value, "SAS")
+            style = saved[STYLE_SHEET]
+            self.assertEqual(style.sheet_state, "hidden")
+            self.assertEqual(style.cell(2, volume).value, "=E2*F2*G2/1000000")
+            self.assertEqual(style.cell(2, fee).value, custom)
+            self.assertTrue(str(style.cell(2, cost).fill.fgColor.rgb).endswith("FFFF00"))
+
+            seller = seller_workbook_path("A1SELLER", Path(directory))
+            self.assertEqual(write_product_workbook(seller, [_product()], template=template), 1)
+            written = load_workbook(seller)
+            sheet = written[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(2, _column(sheet, "名称")).value, "硅胶灶台缝隙盖")
+            self.assertIsNone(sheet.cell(3, 1).value)
+            self.assertTrue(str(sheet.cell(2, _column(sheet, "采购成本")).fill.fgColor.rgb).endswith("FFFF00"))
+            self.assertEqual(sheet.cell(2, _column(sheet, "渠道费用")).value, custom)
+            self.assertEqual(sheet.cell(2, _column(sheet, "毛利率")).number_format, "0.00%")
+            self.assertEqual(load_workbook(template)[TEMPLATE_SHEET].max_row, 1)
+
+            sheet.cell(2, 40, "保留")
+            written.save(seller)
+            other = _product()
+            other["keywords"] = "otro sku"
+            self.assertEqual(write_product_workbook(seller, [other], template=template), 1)
+            sheet = load_workbook(seller)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(2, 40).value, "保留")
+            self.assertEqual(sheet.cell(3, _column(sheet, "SKU")).value, "otro sku")
+            self.assertFalse((Path(directory) / "NONE.xlsx").exists())
+            empty = _product()
+            empty["matches"] = []
+            self.assertEqual(write_product_workbook(Path(directory) / "NONE.xlsx", [empty], template=template), 0)
+            self.assertFalse((Path(directory) / "NONE.xlsx").exists())
 
 
 if __name__ == "__main__":

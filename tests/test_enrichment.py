@@ -9,7 +9,7 @@ from seller_auto.pacing import DelaySettings
 from seller_auto.service import SellerAutoService, _new_state
 from openpyxl import Workbook
 
-from seller_auto.workbook import TEMPLATE_SHEET
+from seller_auto.workbook import TEMPLATE_SHEET, template_path
 
 
 def _product_state() -> dict:
@@ -169,6 +169,16 @@ class EnrichmentTests(unittest.TestCase):
             self.assertEqual(calls["open"], 2)
             self.assertEqual(calls["source"], 2)
             self.assertEqual(service.state["products"]["B07LCLQ47D"]["source_price"]["average"], "8.00")
+
+    def test_workbook_path_follows_the_seller_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            path = service._workbook_for("A1A10HFD4KEZW5")
+            self.assertEqual(path.name, "A1A10HFD4KEZW5.xlsx")
+            self.assertEqual(path.parent, template_path().parent)
+            pinned = Path(directory) / "book.xlsx"
+            pinned_service = SellerAutoService(DelaySettings(), output_dir=directory, workbook_path=str(pinned))
+            self.assertEqual(pinned_service._workbook_for("A1A10HFD4KEZW5"), pinned)
 
     def test_closed_source_error_is_not_recorded_as_missing_price(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

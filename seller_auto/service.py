@@ -52,7 +52,7 @@ from seller_auto.mercadolibre import (
     sales_from_text,
 )
 from seller_auto.sales import has_sales
-from seller_auto.workbook import can_enter_top, template_path, write_product_workbook
+from seller_auto.workbook import can_enter_top, seller_workbook_path, write_product_workbook
 from seller_auto.pacing import DelaySettings
 from seller_auto.sellersprite import open_1688_from_row, open_competitor
 from seller_auto.sourcing import read_page_source
@@ -85,9 +85,9 @@ _MODEL_PIPELINE = frozenset(
     }
 )
 _FOLLOWUP_STEPS = _MODEL_PIPELINE | {"export_results"}
-# 9 条详情 ×（12–25 秒间隔 + 打开页面 + 抓广告）通常是几分钟，灯箱类详情更长。
-# 一次调用等到做完，避免模型用同一句「还在打开」连续查询，被当成空转停掉。
-_BACKGROUND_WAIT_SECONDS = 45 * 60
+# 客户端大约 2 分钟会掐断一次工具调用。提交不能把十几条详情一次等完。
+# session_status 单次最多等 90 秒，到点带回进度，下一次再接着等。
+_BACKGROUND_WAIT_SECONDS = 90
 _BACKGROUND_POLL_SECONDS = 0.2
 _BACKGROUND_LOG_SECONDS = 30
 # 详情中途失败时，同一次调用里再开一轮。仍然失败就停住，不再请模型立刻重试。
@@ -210,7 +210,7 @@ class SellerAutoService:
     ) -> None:
         self.settings = settings.validate()
         self.output_dir = Path(output_dir or settings.output_dir)
-        self.workbook_path = Path(workbook_path) if workbook_path else template_path()
+        self.workbook_path = Path(workbook_path) if workbook_path else None
         self.profile_dir = Path(profile_dir or settings.profile_dir)
         self.headless = settings.headless if headless is None else headless
         self.browser: ArgentinaBrowser | None = None
@@ -225,6 +225,11 @@ class SellerAutoService:
         self._flight_mu = threading.Lock()
         self._flight: _StatusFlight | None = None
         self.background_wait_seconds = _BACKGROUND_WAIT_SECONDS
+
+    def _workbook_for(self, seller_id: str) -> Path:
+        if self.workbook_path is not None:
+            return self.workbook_path
+        return seller_workbook_path(seller_id)
 
     def open_store(self, seller_id: str, product: str = "") -> ToolPayload:
         return self._guard(self._open_store, seller_id, product)
@@ -548,7 +553,10 @@ class SellerAutoService:
             if now >= next_log:
                 progress = self._background_progress(label)
                 if now - started < 1:
-                    step("等待", f"{label}开始等待。{progress}这一次会等到完成再返回。")
+                    step(
+                        "等待",
+                        f"{label}开始等待。{progress}这一次最多等 {self._format_elapsed(self.background_wait_seconds)}，到点会先返回进度。",
+                    )
                 else:
                     step("等待", f"{label}仍在进行，已等 {self._format_elapsed(now - started)}。{progress}")
                 next_log = now + _BACKGROUND_LOG_SECONDS
@@ -1033,7 +1041,7 @@ class SellerAutoService:
         directory = seller_dir(self.output_dir, _storage_id(view))
         path = directory / export_filename()
         atomic_write_json(path, payload)
-        workbook_path = self.workbook_path
+        workbook_path = self._workbook_for(str(view.get("seller_id") or ""))
         products = [view["products"][product_id] for product_id in export_ids if product_id in view["products"]]
         written = write_product_workbook(workbook_path, products)
         removed = self._discard_product_list(products)
@@ -1657,12 +1665,14 @@ class SellerAutoService:
                 if followed is not None:
                     return followed
                 return self._already_submitted_payload(source)
+            if self._sales_pending_now() or self._sales_should_wait():
+                return self._details_still_open_payload(product_id, source)
             return self._coalesced(self._settle_and_read)
         except (UrlError, MatchInputError) as exc:
             return ToolPayload({"ok": False, "status": "error", "message": str(exc)})
 
     def _busy_duplicate(self, matches: list[Any], source: str) -> ToolPayload | None:
-        """同一批还在详情或写表里时，接上同一次等待，把同一步的结果交回去。"""
+        """同一批已经记下时直接交还下一张图，或马上说明详情还在打开。不再接上那次长等待。"""
 
         with self._state_lock:
             try:
@@ -1671,10 +1681,29 @@ class SellerAutoService:
                 return None
             if not self._matches_already_judged(product, matches):
                 return None
-        _ = source
+        ready = self._ready_listing_batch("这一批已经提交过。下面是还没判断的列表图。")
+        if ready is not None:
+            return ready
         if self._background_busy():
-            return self._coalesced(self._settle_and_read)
+            return self._details_still_open_payload(str(product.get("product_id") or ""), source)
         return None
+
+    def _details_still_open_payload(self, product_id: str, source: str) -> ToolPayload:
+        """判断已经记下。详情继续在后台开，这次调用马上返回，避免客户端超时。"""
+
+        return self._payload(
+            {
+                "ok": True,
+                "status": "sales_started",
+                "product_id": product_id,
+                "source": source,
+                "message": (
+                    f"判断已记录，同款详情在后台打开。{self._sales_progress_text()}"
+                    "请调用一次 session_status，它会等一会儿再带回广告图、下一张主图或结束。"
+                    "不要重复提交这一批。提交超时不代表没记下。"
+                ),
+            }
+        )
 
     def _already_submitted_payload(self, source: str) -> ToolPayload:
         with self._state_lock:
