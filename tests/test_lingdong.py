@@ -27,6 +27,7 @@ from seller_auto.lingdong import (
     table_decision,
     total_orders,
 )
+from seller_auto import service as service_module
 from seller_auto.pacing import Cooldown, DelaySettings
 from seller_auto.service import SellerAutoService, _new_state
 from seller_auto.workbook import TEMPLATE_SHEET, display_name
@@ -239,6 +240,44 @@ class LingdongParseTests(unittest.TestCase):
 
 
 class LingdongExportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._quotes = service_module._LINGDONG_QUOTES
+        service_module._LINGDONG_QUOTES = True
+
+    def tearDown(self) -> None:
+        service_module._LINGDONG_QUOTES = self._quotes
+
+    def test_live_export_skips_lingdong_until_reenabled(self) -> None:
+        service_module._LINGDONG_QUOTES = False
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook_path = root / "book.xlsx"
+            _workbook(workbook_path)
+            service = SellerAutoService(DelaySettings(), output_dir=str(root), workbook_path=str(workbook_path))
+            state = _new_state("sess", "SELLER1", "https://www.amazon.com.mx/s?me=SELLER1")
+            state["single_product"] = "B0TEST1234"
+            state["product_order"] = ["B0TEST1234"]
+            state["current_product_id"] = "B0TEST1234"
+            state["products"]["B0TEST1234"] = _asin(
+                "硅胶灶台缝隙盖",
+                "cubiertas",
+                "https://www.mercadolibre.com.ar/p/MLA1",
+            )
+            service.state = state
+            service._save()
+
+            def fake(jobs: list[dict]) -> str:
+                raise AssertionError(jobs)
+
+            service._run_market_quotes = fake
+            service.export_results()
+            payload_data = _wait_export(service)
+            self.assertTrue(payload_data["ok"])
+            self.assertNotIn("蓝鲸", payload_data["message"])
+            self.assertNotIn("30 天", payload_data["message"])
+            sheet = load_workbook(workbook_path)[TEMPLATE_SHEET]
+            self.assertEqual(sheet.cell(2, 1).value, "硅胶灶台缝隙盖")
+
     def test_export_writes_orders_and_fba_without_opening_a_browser(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -85,6 +85,24 @@ class ProgressTests(unittest.TestCase):
     def test_export_in_progress_stays_on_status(self) -> None:
         self.assertEqual(next_required_step(_state(export_pending=True, amazon_done=True)), "session_status")
 
+    def test_export_does_not_hide_unjudged_ads(self) -> None:
+        product = {
+            "keywords": "funda",
+            "listing": {"page2_done": True, "next_index": 1, "candidates": [{"candidate_id": "c1"}]},
+            "judged_ids": ["c1"],
+            "matches": [
+                {
+                    "source": "search",
+                    "ads_scraped": True,
+                    "ads_complete": False,
+                    "ad_next_index": 1,
+                    "ad_candidates": [{"candidate_id": "ad1"}, {"candidate_id": "ad2"}],
+                }
+            ],
+        }
+        state = _state(current_product_id="B0", export_pending=True, products={"B0": product})
+        self.assertEqual(next_required_step(state), "submit_ad_matches")
+
 
 if __name__ == "__main__":
     unittest.main()

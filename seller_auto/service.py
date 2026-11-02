@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import queue
 import threading
+import time
 import traceback
 import urllib.request
 import uuid
@@ -55,7 +56,7 @@ from seller_auto.workbook import can_enter_top, template_path, write_product_wor
 from seller_auto.pacing import DelaySettings
 from seller_auto.sellersprite import open_1688_from_row, open_competitor
 from seller_auto.sourcing import read_page_source
-from seller_auto.progress import next_required_step, products_ready_to_export
+from seller_auto.progress import next_required_step, products_ready_to_export, unfinished_step
 from seller_auto.storage import (
     atomic_write_json,
     build_export,
@@ -75,12 +76,40 @@ from seller_auto.urls import UrlError, clean_keywords, ml_search_url, parse_focu
 BATCH_SIZE = 24
 NEAR_LINK_LIMIT = 5
 NEAR_MIN_SIMILARITY = 0.6
+_MODEL_PIPELINE = frozenset(
+    {
+        "next_listing_batch",
+        "submit_listing_matches",
+        "next_ad_batch",
+        "submit_ad_matches",
+    }
+)
+_FOLLOWUP_STEPS = _MODEL_PIPELINE | {"export_results"}
+# 9 条详情 ×（12–25 秒间隔 + 打开页面 + 抓广告）通常是几分钟，灯箱类详情更长。
+# 一次调用等到做完，避免模型用同一句「还在打开」连续查询，被当成空转停掉。
+_BACKGROUND_WAIT_SECONDS = 45 * 60
+_BACKGROUND_POLL_SECONDS = 0.2
+_BACKGROUND_LOG_SECONDS = 30
+# 详情中途失败时，同一次调用里再开一轮。仍然失败就停住，不再请模型立刻重试。
+_SALES_ERROR_RETRIES = 1
+_VERIFICATION_MESSAGE = "需要手动验证。在前台完成后再次调用 session_status，不要重复提交。"
+# 蓝鲸选品暂时停用。写表只等卖家精灵、货源和运费，不再打开蓝鲸。恢复时改为 True。
+_LINGDONG_QUOTES = False
 
 
 @dataclass
 class ToolPayload:
     data: dict[str, Any]
     images: list[tuple[str, bytes]] = field(default_factory=list)
+
+
+class _StatusFlight:
+    """同一次详情等待只向前走一步。重叠的查询共享这一次的结果。"""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.payload: ToolPayload | None = None
+        self.error: BaseException | None = None
 
 
 class _Worker:
@@ -191,7 +220,11 @@ class SellerAutoService:
         self._enrich_worker = _Worker(name="seller-auto-enrich")
         self._enrich_events: dict[str, threading.Event] = {}
         self._state_lock = threading.RLock()
+        self._pipeline_lock = threading.Lock()
         self._published: dict[str, Any] | None = None
+        self._flight_mu = threading.Lock()
+        self._flight: _StatusFlight | None = None
+        self.background_wait_seconds = _BACKGROUND_WAIT_SECONDS
 
     def open_store(self, seller_id: str, product: str = "") -> ToolPayload:
         return self._guard(self._open_store, seller_id, product)
@@ -218,7 +251,7 @@ class SellerAutoService:
         return self._accept_matches(matches, model_name, "recommendation")
 
     def session_status(self) -> ToolPayload:
-        return self._read_status()
+        return self._coalesced(self._settle_and_read)
 
     def resume_session(self, session_id: str) -> ToolPayload:
         return self._guard(self._resume_session, session_id)
@@ -425,6 +458,267 @@ class SellerAutoService:
             }
         )
 
+    def _coalesced(self, produce: Callable[[], ToolPayload]) -> ToolPayload:
+        with self._flight_mu:
+            flight = self._flight
+            if flight is None:
+                flight = _StatusFlight()
+                self._flight = flight
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            return self._flight_result(flight)
+        try:
+            flight.payload = produce()
+            return flight.payload
+        except Exception as exc:
+            flight.error = exc
+            raise
+        finally:
+            flight.done.set()
+            with self._flight_mu:
+                if self._flight is flight:
+                    self._flight = None
+
+    def _flight_result(self, flight: _StatusFlight) -> ToolPayload:
+        flight.done.wait()
+        if flight.error is not None:
+            raise flight.error
+        if flight.payload is None:
+            raise RuntimeError("等待详情没有返回结果")
+        return flight.payload
+
+    def _settle_and_read(self) -> ToolPayload:
+        """把同款详情和写表的等待放进这一次调用，返回时带上下一步。"""
+
+        try:
+            paused = self._wait_for_background()
+            if paused is not None:
+                return paused
+            with self._pipeline_lock:
+                return self._read_status()
+        except UrlError as exc:
+            return ToolPayload({"ok": False, "status": "error", "message": str(exc)})
+
+    def _wait_for_background(self) -> ToolPayload | None:
+        """详情或写表还在进行时就在这里等完。验证和失败直接返回，不再往下走。"""
+
+        if self._challenge_pending():
+            return self._verification_payload()
+        error_retries = 0
+        while True:
+            self._kick_sales_if_idle(retry_error=True)
+            self._kick_export_if_idle()
+            if self._challenge_pending():
+                return self._verification_payload()
+            if self._sales_should_wait():
+                timed_out = self._wait_while(self._sales_should_wait, "同款详情")
+                if self._challenge_pending():
+                    return self._verification_payload()
+                if timed_out:
+                    return self._background_timeout_payload("sales")
+            if self._sales_failed():
+                if error_retries < _SALES_ERROR_RETRIES:
+                    error_retries += 1
+                    continue
+                return self._sales_stopped_payload()
+            if self._sales_should_wait():
+                continue
+            break
+        if self._sales_pending_now():
+            return self._sales_stopped_payload()
+        if not self._model_pipeline_pending() and self._export_should_wait():
+            if self._wait_while(self._export_should_wait, "写表"):
+                return self._background_timeout_payload("export")
+        return None
+
+    def _wait_while(self, pending: Callable[[], bool], label: str) -> bool:
+        """等到 pending 变为假。到点仍在进行时返回 True。"""
+
+        if not pending():
+            return False
+        started = time.monotonic()
+        next_log = started
+        while True:
+            now = time.monotonic()
+            if not pending():
+                step("等待", f"{label}已经完成，继续下一步。")
+                return False
+            if now >= next_log:
+                progress = self._background_progress(label)
+                if now - started < 1:
+                    step("等待", f"{label}开始等待。{progress}这一次会等到完成再返回。")
+                else:
+                    step("等待", f"{label}仍在进行，已等 {self._format_elapsed(now - started)}。{progress}")
+                next_log = now + _BACKGROUND_LOG_SECONDS
+            if now - started >= self.background_wait_seconds:
+                step(
+                    "等待",
+                    f"{label}这一轮已等 {self._format_elapsed(now - started)}，仍未结束。{self._background_progress(label)}",
+                )
+                return True
+            remaining = self.background_wait_seconds - (time.monotonic() - started)
+            time.sleep(min(_BACKGROUND_POLL_SECONDS, max(0.01, remaining)))
+
+    def _sales_should_wait(self) -> bool:
+        with self._state_lock:
+            state = self.state or {}
+            product = (state.get("products") or {}).get(state.get("current_product_id") or "") or {}
+            if state.get("challenge_pending") or product.get("sales_error"):
+                return False
+            return bool(product.get("sales_pending") and product.get("sales_running"))
+
+    def _export_should_wait(self) -> bool:
+        with self._state_lock:
+            state = self.state or {}
+            if state.get("challenge_pending"):
+                return False
+            return bool(state.get("export_pending") and state.get("export_running"))
+
+    def _challenge_pending(self) -> bool:
+        with self._state_lock:
+            return bool(self.state and self.state.get("challenge_pending"))
+
+    def _sales_pending_now(self) -> bool:
+        with self._state_lock:
+            state = self.state or {}
+            product = (state.get("products") or {}).get(state.get("current_product_id") or "") or {}
+            return bool(product.get("sales_pending"))
+
+    def _sales_failed(self) -> bool:
+        with self._state_lock:
+            state = self.state or {}
+            product = (state.get("products") or {}).get(state.get("current_product_id") or "") or {}
+            return bool(product.get("sales_pending") and product.get("sales_error") and not state.get("challenge_pending"))
+
+    def _background_busy(self) -> bool:
+        with self._state_lock:
+            state = self.state or {}
+            product = (state.get("products") or {}).get(state.get("current_product_id") or "") or {}
+            if state.get("export_pending") or state.get("export_running"):
+                return True
+            if product.get("sales_pending") or product.get("sales_running"):
+                return True
+        with self._flight_mu:
+            return self._flight is not None
+
+    def _verification_payload(self) -> ToolPayload:
+        product_id = ""
+        snapshot = None
+        with self._state_lock:
+            if self.state is not None:
+                product_id = str(self.state.get("current_product_id") or "")
+                snapshot = copy.deepcopy(self._published or self.state)
+        return self._payload(
+            {
+                "ok": True,
+                "status": "needs_human_verification",
+                "product_id": product_id,
+                "message": _VERIFICATION_MESSAGE,
+            },
+            state=snapshot,
+        )
+
+    def _sales_failure_message(self, detail: str) -> str:
+        if detail:
+            return (
+                f"打开详情没有完成：{detail}。这一次已经重试过，先停在这里。"
+                "不要重复提交，不要取下一批。"
+            )
+        return "同款详情没有继续打开。不要重复提交，不要取下一批。"
+
+    def _sales_stopped_payload(self) -> ToolPayload:
+        detail = ""
+        product_id = ""
+        snapshot = None
+        with self._state_lock:
+            if self.state is not None:
+                product_id = str(self.state.get("current_product_id") or "")
+                product = (self.state.get("products") or {}).get(product_id) or {}
+                detail = str(product.get("sales_error") or "")
+                snapshot = copy.deepcopy(self._published or self.state)
+        return self._payload(
+            {
+                "ok": True,
+                "status": "sales_started",
+                "product_id": product_id,
+                "message": self._sales_failure_message(detail),
+            },
+            state=snapshot,
+        )
+
+    def _model_pipeline_pending(self) -> bool:
+        with self._state_lock:
+            state = self.state
+            if not state:
+                return False
+            product = (state.get("products") or {}).get(state.get("current_product_id") or "")
+            if not product or product.get("workbook_written") or product.get("sales_pending"):
+                return False
+            step_name = unfinished_step(product)
+        return step_name in _MODEL_PIPELINE or step_name == "set_keywords"
+
+    def _background_progress(self, label: str) -> str:
+        if label == "写表":
+            with self._state_lock:
+                asin = str((self.state or {}).get("current_product_id") or "")
+            return f"{asin} 正在写入表格。" if asin else "正在写入表格。"
+        return self._sales_progress_text()
+
+    def _sales_progress_text(self) -> str:
+        with self._state_lock:
+            state = self.state or {}
+            product = (state.get("products") or {}).get(state.get("current_product_id") or "") or {}
+            if not product:
+                return ""
+            remaining = len(self._pending_sale_items(product, "search")) + len(
+                self._pending_sale_items(product, "recommendation")
+            )
+            checked = len(product.get("checked_keys") or [])
+            name = str(product.get("chinese_name") or "").strip()
+            asin = str(product.get("product_id") or "")
+        if name and asin:
+            label = f"{name}（{asin}）"
+        else:
+            label = name or asin
+        head = f"{label} " if label else ""
+        return f"{head}已核对 {checked} 条，还剩 {remaining} 条详情。"
+
+    def _format_elapsed(self, elapsed: float) -> str:
+        seconds = max(1, int(elapsed))
+        if seconds < 60:
+            return f"{seconds} 秒"
+        return f"{seconds // 60} 分 {seconds % 60} 秒"
+
+    def _timeout_message(self, kind: str) -> str:
+        waited = self._format_elapsed(self.background_wait_seconds)
+        if kind == "export":
+            return (
+                f"正在写入表格。这一次已经等了约 {waited}，写表仍在进行。"
+                "请再调用一次 session_status，它会继续等到写完。不要连续查询，不要重复 export_results。"
+            )
+        return (
+            f"同款详情还在打开。{self._sales_progress_text()}"
+            f"这一次已经等了约 {waited}，后台仍在逐条打开，没有卡死。"
+            "请再调用一次 session_status，它会继续等完。不要连续查询，不要重复提交，也不要取下一批。"
+        )
+
+    def _background_timeout_payload(self, kind: str) -> ToolPayload:
+        product_id = ""
+        with self._state_lock:
+            if self.state is not None:
+                product_id = str(self.state.get("current_product_id") or "")
+        status = "exporting" if kind == "export" else "sales_started"
+        return self._payload(
+            {
+                "ok": True,
+                "status": status,
+                "product_id": product_id,
+                "message": self._timeout_message(kind),
+            }
+        )
+
     def _read_status(self) -> ToolPayload:
         try:
             self._kick_sales_if_idle()
@@ -436,13 +730,15 @@ class SellerAutoService:
             if snapshot is None:
                 raise UrlError("还没有会话。请先调用 open_store 或 resume_session")
             product = (snapshot.get("products") or {}).get(snapshot.get("current_product_id") or "") or {}
-            if product.get("sales_pending") or snapshot.get("export_pending") or snapshot.get("challenge_pending"):
+            if product.get("sales_pending") or snapshot.get("challenge_pending"):
                 return self._payload(
                     {"ok": True, "status": "status", "message": self._status_message(snapshot)},
                     state=snapshot,
                 )
             step_name = next_required_step(snapshot)
-            if step_name in {"next_listing_batch", "submit_listing_matches", "next_ad_batch", "submit_ad_matches", "export_results"}:
+            if step_name == "set_keywords":
+                return self._current_amazon_payload(snapshot)
+            if step_name in _FOLLOWUP_STEPS:
                 recorded = self._payload(
                     {
                         "ok": True,
@@ -460,18 +756,52 @@ class SellerAutoService:
         except UrlError as exc:
             return ToolPayload({"ok": False, "status": "error", "message": str(exc)})
 
+    def _current_amazon_payload(self, snapshot: dict[str, Any]) -> ToolPayload:
+        """主图已经打开、关键词还没写时，把这张图再次带上，避免上一次返回丢失后流程断掉。"""
+
+        product = (snapshot.get("products") or {}).get(snapshot.get("current_product_id") or "") or {}
+        product_id = str(product.get("product_id") or "")
+        message = (
+            "请根据主图给出西班牙语搜索关键词，然后调用 set_keywords。"
+            "卖家精灵和货源查询已在后台并行开始，不要等它们。"
+        )
+        if snapshot.get("single_product"):
+            message += "这是指定的一条商品，不要再调用 next_amazon_product。"
+        else:
+            message += "这一条筛完后服务会自己写表并打开下一条，不要调用 export_results。"
+        return self._payload(
+            {
+                "ok": True,
+                "status": "amazon_product",
+                "product_id": product_id,
+                "title": product.get("title") or "",
+                "brand": product.get("brand") or "",
+                "url": product.get("url") or "",
+                "message": message,
+            },
+            [(f"亚马逊主图 product_id={product_id}", str(product.get("image_path") or ""))],
+            state=snapshot,
+        )
+
     def _status_message(self, state: dict[str, Any]) -> str:
-        if state.get("export_pending"):
-            return "正在查询蓝鲸并写入表格。请继续 session_status，不要重复 export_results。"
         products = state.get("products") or {}
         product = products.get(state.get("current_product_id") or "") or {}
+        if state.get("challenge_pending"):
+            return _VERIFICATION_MESSAGE
         if product.get("sales_pending"):
-            if state.get("challenge_pending"):
-                return "需要手动验证。在前台完成后再次调用 session_status，不要重复提交。"
             detail = str(product.get("sales_error") or "")
             if detail:
-                return f"打开详情没有完成：{detail}。请再次 session_status，不要重复提交。"
-            return "同款详情还在打开。请继续 session_status，不要重复提交，也不要取下一批。"
+                return self._sales_failure_message(detail)
+            return (
+                f"同款详情还在打开。{self._sales_progress_text()}"
+                "请再调用一次 session_status，它会等到开完再返回下一步。"
+                "不要连续查询，不要重复提交，也不要取下一批。"
+            )
+        if state.get("export_pending"):
+            return (
+                "正在写入表格。请再调用一次 session_status，它会等到写完。"
+                "不要连续查询，不要重复 export_results。"
+            )
         step_name = next_required_step(state)
         exported_message = self._visible_export_message(state, step_name)
         if exported_message:
@@ -512,7 +842,7 @@ class SellerAutoService:
                         {
                             "ok": True,
                             "status": "exporting",
-                            "message": "正在查询蓝鲸并写入表格。请继续 session_status，不要重复 export_results。",
+                            "message": "正在写入表格。请再调用一次 session_status，它会等到写完。不要连续查询，不要重复 export_results。",
                         },
                         state=snapshot,
                     )
@@ -530,7 +860,7 @@ class SellerAutoService:
                 {
                     "ok": True,
                     "status": "status",
-                    "message": "同款详情还在打开。请先 session_status，完成后再 export_results。",
+                    "message": "同款详情还在打开。请再调用一次 session_status，它会等到开完。不要连续查询。",
                 },
                 state=snapshot,
             )
@@ -539,7 +869,7 @@ class SellerAutoService:
             {
                 "ok": True,
                 "status": "exporting",
-                "message": "这一条 ASIN 已经走完。正在查询蓝鲸并写入表格。请继续 session_status，不要重复 export_results。",
+                "message": "这一条 ASIN 已经走完。正在写入表格。请再调用一次 session_status，它会等到写完。不要连续查询，不要重复 export_results。",
             },
             state=snapshot,
         )
@@ -664,6 +994,9 @@ class SellerAutoService:
         step("导出", "会话已更换，原商品已写入表格")
 
     def _market_quotes_inline(self, export_ids: list[str]) -> str:
+        # 蓝鲸选品暂时停用，避免登录和查询把这一轮写表拖住。恢复时把 _LINGDONG_QUOTES 改回 True。
+        if not _LINGDONG_QUOTES:
+            return ""
         with self._state_lock:
             state = self.state
             if state is None:
@@ -1283,56 +1616,81 @@ class SellerAutoService:
 
     def _accept_matches(self, matches: list[Any], model_name: str, source: str) -> ToolPayload:
         try:
-            with self._state_lock:
-                product = self._current_product()
-                if self._matches_already_judged(product, matches):
-                    snapshot = copy.deepcopy(self._published or self.state)
-                    return self._payload(
-                        {
-                            "ok": True,
-                            "status": "already_submitted",
-                            "product_id": product.get("product_id"),
-                            "source": source,
-                            "message": "这一批已经提交过。不要重复提交。手上的下一批图还在就直接判断。",
-                        },
-                        state=snapshot,
+            followed = self._busy_duplicate(matches, source)
+            if followed is not None:
+                return followed
+            with self._pipeline_lock:
+                duplicate = False
+                with self._state_lock:
+                    product = self._current_product()
+                    if self._matches_already_judged(product, matches):
+                        duplicate = True
+                    else:
+                        self._apply_match_decisions(product, matches, model_name)
+                        needs_open = self._has_pending_sales(product)
+                        product_id = str(product.get("product_id") or "")
+                        self._commit_locked()
+                if not duplicate:
+                    note = (
+                        "判断已记录，同款详情在后台打开。下面是下一批列表图。"
+                        if needs_open
+                        else "判断已记录。下面是下一批列表图。"
                     )
-                self._apply_match_decisions(product, matches, model_name)
-                needs_open = self._has_pending_sales(product)
-                product_id = str(product.get("product_id") or "")
-                self._commit_locked()
-            note = (
-                "判断已记录，同款详情在后台打开。下面是下一批列表图。"
-                if needs_open
-                else "判断已记录。下面是下一批列表图。"
-            )
-            if needs_open:
-                self._queue_sales(prefetch_listing=not self._current_product()["listing"].get("page2_done"))
-            ready = self._ready_listing_batch(note)
-            if ready is not None:
-                return ready
-            if needs_open or self._current_product().get("sales_pending"):
-                return self._payload(
-                    {
-                        "ok": True,
-                        "status": "sales_started",
-                        "product_id": product_id,
-                        "source": source,
-                        "message": "判断已记录，同款详情还在打开。请只调用 session_status，下一批图或下一张主图好了会直接带上。不要重复提交。",
-                    }
-                )
-            recorded = self._payload(
-                {
-                    "ok": True,
-                    "status": "matches_recorded",
-                    "product_id": product_id,
-                    "source": source,
-                    "message": "判断已记录。",
-                }
-            )
-            return self._worker.call(self._attach_followup, recorded)
+                    if needs_open:
+                        self._queue_sales(prefetch_listing=not self._current_product()["listing"].get("page2_done"))
+                    ready = self._ready_listing_batch(note)
+                    if ready is not None:
+                        return ready
+                    if not needs_open and not self._current_product().get("sales_pending"):
+                        recorded = self._payload(
+                            {
+                                "ok": True,
+                                "status": "matches_recorded",
+                                "product_id": product_id,
+                                "source": source,
+                                "message": "判断已记录。",
+                            }
+                        )
+                        return self._worker.call(self._attach_followup, recorded)
+            if duplicate:
+                followed = self._busy_duplicate(matches, source)
+                if followed is not None:
+                    return followed
+                return self._already_submitted_payload(source)
+            return self._coalesced(self._settle_and_read)
         except (UrlError, MatchInputError) as exc:
             return ToolPayload({"ok": False, "status": "error", "message": str(exc)})
+
+    def _busy_duplicate(self, matches: list[Any], source: str) -> ToolPayload | None:
+        """同一批还在详情或写表里时，接上同一次等待，把同一步的结果交回去。"""
+
+        with self._state_lock:
+            try:
+                product = self._current_product()
+            except UrlError:
+                return None
+            if not self._matches_already_judged(product, matches):
+                return None
+        _ = source
+        if self._background_busy():
+            return self._coalesced(self._settle_and_read)
+        return None
+
+    def _already_submitted_payload(self, source: str) -> ToolPayload:
+        with self._state_lock:
+            product = self._current_product()
+            snapshot = copy.deepcopy(self._published or self.state)
+            product_id = product.get("product_id")
+        return self._payload(
+            {
+                "ok": True,
+                "status": "already_submitted",
+                "product_id": product_id,
+                "source": source,
+                "message": "这一批已经提交过。不要重复提交。手上的下一批图还在就直接判断。",
+            },
+            state=snapshot,
+        )
 
     def _matches_already_judged(self, product: dict[str, Any], matches: list[Any]) -> bool:
         judged = set(product.get("judged_ids") or [])
@@ -1388,8 +1746,14 @@ class SellerAutoService:
             )
         if product.get("sales_pending"):
             detail = str(product.get("sales_error") or "")
-            message = f"打开详情没有完成：{detail}。请再次 session_status，不要重复提交。" if detail else (
-                "同款详情还在打开。请再次 session_status，不要重复提交。"
+            message = (
+                self._sales_failure_message(detail)
+                if detail
+                else (
+                    f"同款详情还在打开。{self._sales_progress_text()}"
+                    "请再调用一次 session_status，它会等到开完再返回下一步。"
+                    "不要连续查询，不要重复提交。"
+                )
             )
             return self._payload(
                 {
@@ -1480,13 +1844,17 @@ class SellerAutoService:
             )
         return items
 
-    def _kick_sales_if_idle(self) -> None:
+    def _kick_sales_if_idle(self, *, retry_error: bool = False) -> None:
         with self._state_lock:
             state = self.state
             if not state:
                 return
             product = (state.get("products") or {}).get(state.get("current_product_id") or "")
+            if state.get("challenge_pending"):
+                return
             if not product or not product.get("sales_pending") or product.get("sales_running"):
+                return
+            if product.get("sales_error") and not retry_error:
                 return
             if not self._has_pending_sales(product):
                 product["sales_pending"] = False
@@ -1967,27 +2335,45 @@ class SellerAutoService:
             if blocked is not None:
                 return blocked
         self._start_export()
+        if self._export_should_wait():
+            if self._wait_while(self._export_should_wait, "写表"):
+                return self._background_timeout_payload("export")
+        written = self._export_note()
         state = self._require_state()
         if state.get("single_product") or state.get("amazon_done"):
+            if written:
+                message = written if "export_results" in written else f"{written}不要再调用 export_results。"
+            else:
+                message = "这一条已经筛完，表格在后台写入。不要再调用 export_results 或 next_amazon_product。"
             return self._payload(
                 {
                     "ok": True,
                     "status": "finished",
                     "product_id": product_id,
                     "next_step": "done",
-                    "message": "这一条已经筛完，表格在后台写入。不要再调用 export_results 或 next_amazon_product。",
+                    "message": message,
                 }
             )
         opened = self._next_amazon_product()
         if opened.data.get("status") == "amazon_product":
+            table = written if written else "上一条的表格在后台写入，"
+            if "export_results" not in table:
+                table = f"{table}不要调用 export_results。"
             opened.data["message"] = (
                 "下一条亚马逊商品已打开。请直接 set_keywords。"
-                "上一条的表格在后台写入，不要调用 export_results。"
+                f"{table}"
                 "卖家精灵和货源查询已在后台开始，不要等它们。"
             )
         elif opened.data.get("status") == "end_of_store":
-            opened.data["message"] = "店铺列表已经读完。表格在后台写入，不要再调用 export_results 或 next_amazon_product。"
+            tail = written or "表格在后台写入，"
+            if "export_results" not in tail:
+                tail = f"{tail}不要再调用 export_results 或 next_amazon_product。"
+            opened.data["message"] = f"店铺列表已经读完。{tail}"
         return opened
+
+    def _export_note(self) -> str:
+        with self._state_lock:
+            return str(((self.state or {}).get("export_result") or {}).get("message") or "").strip()
 
     def _fill_near_matches(self, product: dict[str, Any]) -> ToolPayload | None:
         """没有同款时，按相似度从高到低补有销量的链接，最多 5 条，写进原来那一行。"""

@@ -6,8 +6,6 @@ from typing import Any
 
 
 def next_required_step(state: dict[str, Any]) -> str:
-    if state.get("export_pending"):
-        return "session_status"
     products = state.get("products") or {}
     current_id = state.get("current_product_id")
     product = products.get(current_id or "")
@@ -15,7 +13,11 @@ def next_required_step(state: dict[str, Any]) -> str:
         pending = unfinished_step(product)
         if pending:
             return pending
+        if state.get("export_pending"):
+            return "session_status"
         return "export_results"
+    if state.get("export_pending"):
+        return "session_status"
     if state.get("amazon_done") and not _sales_pending(state):
         return "export_results"
     if not product:
