@@ -9,3 +9,4 @@ output/
 .DS_Store
 .env.local
 *.xlsx
+!template.xlsx
