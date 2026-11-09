@@ -3,9 +3,10 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from seller_auto.pacing import DelaySettings
-from seller_auto.service import SellerAutoService, _new_state, _replay_ad_batch
+from seller_auto.service import SellerAutoService, ToolPayload, _new_state, _replay_ad_batch
 
 
 def _state() -> dict:
@@ -392,9 +393,88 @@ class DispatchTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1)
             self.assertEqual(calls, [])
             self.assertFalse(service.state["products"]["B07LCLQ47D"].get("sales_running"))
-            self.assertIn("手动验证", payload.data["message"])
+            self.assertIn("需要验证", payload.data["message"])
+            self.assertIn("没有打开窗口", payload.data["message"])
             self.assertNotIn("还在打开", payload.data["message"])
             self.assertNotIn("请再调用一次 session_status", payload.data["message"])
+
+    def test_session_status_presents_challenge_headless(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            state = _state()
+            state["challenge_pending"] = True
+            service.state = state
+            service._save()
+            page = mock.Mock()
+            browser = mock.Mock()
+            browser.background = True
+            browser.challenge_pending = True
+            browser.challenge_site = "ml"
+            browser.list_page = page
+            browser.detail_page = None
+            browser.ensure_clear.return_value = {
+                "ok": False,
+                "status": "needs_human_verification",
+                "message": "自主验证还没通过，浏览器仍保持无头。",
+                "url": "https://www.mercadolibre.com.mx/captcha/wall",
+            }
+            service.browser = browser
+            payload = service.session_status()
+            browser.ensure_clear.assert_called_once_with(page, "ml", present=True)
+            self.assertEqual(payload.data["status"], "needs_human_verification")
+            self.assertIn("无头", payload.data["message"])
+
+    def test_submit_captcha_selection_attaches_tile_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            state = _state()
+            state["challenge_pending"] = True
+            service.state = state
+            service._save()
+            page = mock.Mock()
+            browser = mock.Mock()
+            browser.detail_page = None
+            browser.list_page = page
+            browser.challenge_pending = True
+            browser.challenge_site = "ml"
+            browser.apply_captcha_selection.return_value = {
+                "ok": False,
+                "status": "needs_captcha_selection",
+                "message": "继续选",
+                "challenge_id": "next",
+                "prompt": "coches",
+                "tile_count": 9,
+                "grid": "3x3",
+                "image_bytes": [("tile_0", b"\xff\xd8\xffjpeg")],
+            }
+            service.browser = browser
+            with mock.patch.object(service, "_ensure_browser", return_value=browser):
+                payload = service.submit_captcha_selection([1, 2], "old")
+            browser.apply_captcha_selection.assert_called_once_with(page, [1, 2], "old")
+            self.assertEqual(payload.data["status"], "needs_captcha_selection")
+            self.assertNotIn("image_bytes", payload.data)
+            self.assertEqual(payload.images[0][0], "tile_0")
+
+    def test_submit_captcha_selection_continues_when_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            state = _state()
+            service.state = state
+            service._save()
+            page = mock.Mock()
+            browser = mock.Mock()
+            browser.detail_page = None
+            browser.list_page = page
+            browser.apply_captcha_selection.return_value = None
+            service.browser = browser
+            continued = ToolPayload({"ok": True, "status": "listing_batch", "message": "下一步"})
+            with (
+                mock.patch.object(service, "_ensure_browser", return_value=browser),
+                mock.patch.object(service, "_settle_and_read", return_value=continued) as settle,
+            ):
+                payload = service.submit_captcha_selection([0], "cid")
+            settle.assert_called_once()
+            self.assertEqual(payload.data["status"], "listing_batch")
 
     def test_overlapping_status_calls_follow_through_once(self) -> None:
         release = threading.Event()

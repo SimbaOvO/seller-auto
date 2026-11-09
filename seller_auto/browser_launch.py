@@ -17,9 +17,8 @@ from typing import Any, NamedTuple
 
 from seller_auto.step_log import step
 
-# 和 mercadolibre-login 一样：隐藏 webdriver、HeadlessChrome，并让后台页面保持可见。
+# HeadlessChrome 从 UA 里去掉，后台页面保持可见。webdriver 交给 playwright-stealth。
 STEALTH_JS = """
-try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
 try {
   const ua = navigator.userAgent.replace(/HeadlessChrome/g, "Chrome");
   if (ua !== navigator.userAgent) Object.defineProperty(navigator, "userAgent", { configurable: true, get: () => ua });
@@ -30,12 +29,68 @@ try {
 } catch (e) {}
 """.strip()
 
+
+def automation_stealth() -> Any:
+    """Python 版 puppeteer-extra-plugin-stealth。只抹 webdriver，不改画布、WebGL 或操作系统。"""
+
+    from playwright_stealth import ALL_EVASIONS_DISABLED_KWARGS, Stealth
+
+    return Stealth(
+        **{**ALL_EVASIONS_DISABLED_KWARGS, "navigator_webdriver": True},
+        navigator_languages_override=None,
+        navigator_platform_override=None,
+        init_scripts_only=True,
+    )
+
+
+def apply_stealth(context: Any) -> None:
+    automation_stealth().apply_stealth_sync(context)
+
+
+# enterprise.js 在国内线路会写入 gstatic.cn；美客多 CSP 只允许 gstatic.com，必须在插入脚本前改掉。
+RECAPTCHA_CDN_FIX_JS = """
+(() => {
+  const fix = (value) => String(value || "")
+    .replace(/:\\/\\/www\\.gstatic\\.cn\\//g, "://www.gstatic.com/")
+    .replace(/:\\/\\/gstatic\\.cn\\//g, "://www.gstatic.com/");
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, "src");
+    if (descriptor && descriptor.set && descriptor.get) {
+      Object.defineProperty(HTMLScriptElement.prototype, "src", {
+        configurable: true,
+        enumerable: true,
+        get() { return descriptor.get.call(this); },
+        set(value) { return descriptor.set.call(this, fix(value)); },
+      });
+    }
+  } catch (e) {}
+  try {
+    const setAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, value) {
+      if (this.tagName === "SCRIPT" && String(name).toLowerCase() === "src") {
+        return setAttribute.call(this, name, fix(value));
+      }
+      return setAttribute.call(this, name, value);
+    };
+  } catch (e) {}
+})();
+""".strip()
+
+
+def install_recaptcha_cdn_fix(context: Any) -> None:
+    """美客多 CSP 只放行 gstatic.com。把即将插入的 gstatic.cn 脚本改成 gstatic.com。"""
+
+    context.add_init_script(RECAPTCHA_CDN_FIX_JS)
+
+
 LAUNCH_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
     "--hide-crash-restore-bubble",
     "--disable-session-crashed-bubble",
     "--disable-blink-features=AutomationControlled",
+    # TUN 已接管流量时，不要再叠一层 HTTP/SOCKS 代理。
+    "--no-proxy-server",
     "--window-size=1440,900",
     "--lang=es-AR",
 ]

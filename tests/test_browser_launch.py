@@ -12,6 +12,10 @@ from unittest import mock
 
 from seller_auto.browser_launch import (
     STEALTH_JS,
+    RECAPTCHA_CDN_FIX_JS,
+    apply_stealth,
+    automation_stealth,
+    install_recaptcha_cdn_fix,
     _CHROME_COMMANDS_SCRIPT,
     _PROFILE_PIDS,
     _decode_process_row,
@@ -47,11 +51,44 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertNotIn("--window-position=-32000,-32000", options["args"])
         self.assertIn("--enable-automation", options["ignore_default_args"])
         self.assertIn("--disable-blink-features=AutomationControlled", options["args"])
+        self.assertIn("--no-proxy-server", options["args"])
+        self.assertNotIn("proxy", options)
         self.assertEqual(options["locale"], "es-AR")
         self.assertNotIn("canvas", STEALTH_JS.lower())
         self.assertNotIn("webgl", STEALTH_JS.lower())
-        self.assertIn("webdriver", STEALTH_JS)
+        self.assertNotIn("webdriver", STEALTH_JS)
         self.assertIn("HeadlessChrome", STEALTH_JS)
+        stealth = automation_stealth()
+        self.assertTrue(stealth.navigator_webdriver)
+        self.assertFalse(stealth.webgl_vendor)
+        self.assertFalse(stealth.navigator_platform)
+        self.assertFalse(stealth.navigator_user_agent)
+        self.assertIn("webdriver", stealth.script_payload)
+        self.assertNotIn("loading webgl.vendor.js", stealth.script_payload)
+        self.assertNotIn("loading navigator.platform.js", stealth.script_payload)
+
+    def test_recaptcha_cdn_fix_rewrites_gstatic_cn(self) -> None:
+        context = mock.Mock()
+        install_recaptcha_cdn_fix(context)
+        context.add_init_script.assert_called_once_with(RECAPTCHA_CDN_FIX_JS)
+        self.assertIn(r"gstatic\.cn", RECAPTCHA_CDN_FIX_JS)
+        self.assertIn("gstatic.com", RECAPTCHA_CDN_FIX_JS)
+
+    def test_apply_stealth_injects_webdriver_script(self) -> None:
+        class Context:
+            def __init__(self) -> None:
+                self.scripts: list[str] = []
+
+            def add_init_script(self, script: str) -> None:
+                self.scripts.append(script)
+
+        context = Context()
+        apply_stealth(context)
+        self.assertEqual(len(context.scripts), 1)
+        payload = context.scripts[0]
+        self.assertIn("webdriver", payload)
+        self.assertNotIn("loading webgl.vendor.js", payload)
+        self.assertNotIn("canvas", payload.lower())
 
     def test_foreground_keeps_the_browser_user_agent(self) -> None:
         options = persistent_context_options(

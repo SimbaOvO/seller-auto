@@ -92,7 +92,7 @@ _BACKGROUND_POLL_SECONDS = 0.2
 _BACKGROUND_LOG_SECONDS = 30
 # 详情中途失败时，同一次调用里再开一轮。仍然失败就停住，不再请模型立刻重试。
 _SALES_ERROR_RETRIES = 1
-_VERIFICATION_MESSAGE = "需要手动验证。在前台完成后再次调用 session_status，不要重复提交。"
+_VERIFICATION_MESSAGE = NEEDS_HUMAN
 # 蓝鲸选品暂时停用。写表只等卖家精灵、货源和运费，不再打开蓝鲸。恢复时改为 True。
 _LINGDONG_QUOTES = False
 
@@ -258,6 +258,9 @@ class SellerAutoService:
     def session_status(self) -> ToolPayload:
         return self._coalesced(self._settle_and_read)
 
+    def submit_captcha_selection(self, indices: list[Any], challenge_id: str = "") -> ToolPayload:
+        return self._guard(self._submit_captcha_selection, indices, challenge_id)
+
     def resume_session(self, session_id: str) -> ToolPayload:
         return self._guard(self._resume_session, session_id)
 
@@ -288,7 +291,18 @@ class SellerAutoService:
 
     def _ensure_browser(self) -> ArgentinaBrowser:
         if self.browser is None:
-            self.browser = ArgentinaBrowser(self.settings, self.profile_dir, headless=self.headless)
+            from seller_auto.exit_identity import resolve_exit_identity
+
+            identity = resolve_exit_identity()
+            self.browser = ArgentinaBrowser(
+                self.settings,
+                self.profile_dir,
+                headless=self.headless,
+                locale=identity.locale,
+                accept_language=identity.accept_language,
+                timezone_id=identity.timezone_id,
+                geolocation=identity.geolocation,
+            )
         self.browser.start()
         assert self.browser is not None
         return self.browser
@@ -399,7 +413,28 @@ class SellerAutoService:
 
     def _blocked(self, blocked: dict[str, Any]) -> ToolPayload:
         self._save()
-        return self._payload(blocked)
+        payload_data = dict(blocked)
+        image_bytes = list(payload_data.pop("image_bytes", None) or [])
+        payload = self._payload(payload_data)
+        if image_bytes:
+            return ToolPayload(payload.data, list(payload.images) + image_bytes)
+        return payload
+
+    def _submit_captcha_selection(self, indices: list[Any], challenge_id: str = "") -> ToolPayload:
+        browser = self._ensure_browser()
+        page = browser.detail_page or browser.list_page
+        if page is None:
+            return ToolPayload({"ok": False, "status": "error", "message": "浏览器还没打开"})
+        chosen: list[int] = []
+        for item in indices or []:
+            try:
+                chosen.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        blocked = browser.apply_captcha_selection(page, chosen, challenge_id or "")
+        if blocked is not None:
+            return self._blocked(blocked)
+        return self._settle_and_read()
 
     def _open_store(self, seller_id: str, product: str = "") -> ToolPayload:
         seller_id, store_url = resolve_store_input(seller_id)
@@ -510,13 +545,17 @@ class SellerAutoService:
         """详情或写表还在进行时就在这里等完。验证和失败直接返回，不再往下走。"""
 
         if self._challenge_pending():
-            return self._verification_payload()
+            paused = self._present_challenge()
+            if paused is not None:
+                return paused
         error_retries = 0
         while True:
             self._kick_sales_if_idle(retry_error=True)
             self._kick_export_if_idle()
             if self._challenge_pending():
-                return self._verification_payload()
+                paused = self._present_challenge()
+                if paused is not None:
+                    return paused
             if self._sales_should_wait():
                 timed_out = self._wait_while(self._sales_should_wait, "同款详情")
                 if self._challenge_pending():
@@ -610,6 +649,28 @@ class SellerAutoService:
                 return True
         with self._flight_mu:
             return self._flight is not None
+
+    def _present_challenge(self) -> ToolPayload | None:
+        """在无头里自主尝试验证；图片题截格返回给模型点选。"""
+
+        browser = self.browser
+        if browser is None or not browser.background:
+            return self._verification_payload()
+        page = browser.detail_page or browser.list_page
+        if page is None:
+            return self._verification_payload()
+        site = browser.challenge_site or "ml"
+
+        def clear() -> dict[str, Any] | None:
+            return browser.ensure_clear(page, site, present=True)
+
+        if threading.current_thread() is self._worker._thread:
+            blocked = clear()
+        else:
+            blocked = self._worker.call(clear)
+        if blocked:
+            return self._blocked(blocked)
+        return None
 
     def _verification_payload(self) -> ToolPayload:
         product_id = ""
@@ -1770,7 +1831,7 @@ class SellerAutoService:
                     "status": "needs_human_verification",
                     "product_id": product_id,
                     "source": source,
-                    "message": "需要手动验证。在前台完成后再次调用 session_status，不要重复提交。",
+                    "message": _VERIFICATION_MESSAGE,
                 }
             )
         if product.get("sales_pending"):

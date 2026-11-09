@@ -35,10 +35,18 @@ class ToolContractTests(unittest.TestCase):
                 "next_ad_batch",
                 "submit_ad_matches",
                 "session_status",
+                "submit_captcha_selection",
                 "resume_session",
                 "export_results",
             },
         )
+        captcha_schema = tools["submit_captcha_selection"].parameters
+        self.assertIn("indices", captcha_schema["properties"])
+        self.assertIn("challenge_id", captcha_schema["properties"])
+        self.assertIn("indices", captcha_schema["required"])
+        self.assertIn("submit_captcha_selection", INSTRUCTIONS)
+        self.assertIn("needs_captcha_selection", INSTRUCTIONS)
+        self.assertNotIn("Computer Use", INSTRUCTIONS)
         schema = tools["submit_listing_matches"].parameters
         self.assertIn("matches", schema["properties"])
         self.assertIn("model_name", schema["properties"])
