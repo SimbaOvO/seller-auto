@@ -15,6 +15,13 @@ import threading
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from seller_auto.exit_identity import (
+    CHINA_ACCEPT_LANGUAGE,
+    CHINA_GEOLOCATION,
+    CHINA_LOCALE,
+    CHINA_TIMEZONE_ID,
+)
+from seller_auto.proxy import browser_proxy
 from seller_auto.step_log import step
 
 # HeadlessChrome 从 UA 里去掉，后台页面保持可见。webdriver 交给 playwright-stealth。
@@ -47,52 +54,14 @@ def apply_stealth(context: Any) -> None:
     automation_stealth().apply_stealth_sync(context)
 
 
-# enterprise.js 在国内线路会写入 gstatic.cn；美客多 CSP 只允许 gstatic.com，必须在插入脚本前改掉。
-RECAPTCHA_CDN_FIX_JS = """
-(() => {
-  const fix = (value) => String(value || "")
-    .replace(/:\\/\\/www\\.gstatic\\.cn\\//g, "://www.gstatic.com/")
-    .replace(/:\\/\\/gstatic\\.cn\\//g, "://www.gstatic.com/");
-  try {
-    const descriptor = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, "src");
-    if (descriptor && descriptor.set && descriptor.get) {
-      Object.defineProperty(HTMLScriptElement.prototype, "src", {
-        configurable: true,
-        enumerable: true,
-        get() { return descriptor.get.call(this); },
-        set(value) { return descriptor.set.call(this, fix(value)); },
-      });
-    }
-  } catch (e) {}
-  try {
-    const setAttribute = Element.prototype.setAttribute;
-    Element.prototype.setAttribute = function(name, value) {
-      if (this.tagName === "SCRIPT" && String(name).toLowerCase() === "src") {
-        return setAttribute.call(this, name, fix(value));
-      }
-      return setAttribute.call(this, name, value);
-    };
-  } catch (e) {}
-})();
-""".strip()
-
-
-def install_recaptcha_cdn_fix(context: Any) -> None:
-    """美客多 CSP 只放行 gstatic.com。把即将插入的 gstatic.cn 脚本改成 gstatic.com。"""
-
-    context.add_init_script(RECAPTCHA_CDN_FIX_JS)
-
-
 LAUNCH_ARGS = [
     "--no-first-run",
     "--no-default-browser-check",
     "--hide-crash-restore-bubble",
     "--disable-session-crashed-bubble",
     "--disable-blink-features=AutomationControlled",
-    # TUN 已接管流量时，不要再叠一层 HTTP/SOCKS 代理。
-    "--no-proxy-server",
     "--window-size=1440,900",
-    "--lang=es-AR",
+    f"--lang={CHINA_LOCALE}",
 ]
 
 _CHROME_GLOBS = (
@@ -677,9 +646,9 @@ def persistent_context_options(
     *,
     headless: bool,
     chrome_version: str | None = None,
-    locale: str = "es-AR",
-    accept_language: str = "es-AR,es;q=0.9",
-    timezone_id: str = "America/Argentina/Buenos_Aires",
+    locale: str = CHINA_LOCALE,
+    accept_language: str = CHINA_ACCEPT_LANGUAGE,
+    timezone_id: str = CHINA_TIMEZONE_ID,
     geolocation: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """后台用完整 Chrome 的无头模式。不传 channel 时，Playwright 会改用精简的 headless shell。"""
@@ -692,11 +661,12 @@ def persistent_context_options(
         "channel": "chrome-for-testing",
         "locale": locale,
         "timezone_id": timezone_id,
-        "geolocation": geolocation or {"latitude": -34.6037, "longitude": -58.3816},
+        "geolocation": dict(geolocation or CHINA_GEOLOCATION),
         "permissions": ["geolocation"],
         "viewport": {"width": 1440, "height": 900},
         "extra_http_headers": {"Accept-Language": accept_language},
         "ignore_default_args": ["--enable-automation"],
+        "proxy": browser_proxy(),
         "args": args,
     }
     if headless and chrome_version:

@@ -92,7 +92,7 @@ _BACKGROUND_POLL_SECONDS = 0.2
 _BACKGROUND_LOG_SECONDS = 30
 # 详情中途失败时，同一次调用里再开一轮。仍然失败就停住，不再请模型立刻重试。
 _SALES_ERROR_RETRIES = 1
-_VERIFICATION_MESSAGE = NEEDS_HUMAN
+_VERIFICATION_MESSAGE = "需要手动验证。在前台完成后再次调用 session_status，不要重复提交。"
 # 蓝鲸选品暂时停用。写表只等卖家精灵、货源和运费，不再打开蓝鲸。恢复时改为 True。
 _LINGDONG_QUOTES = False
 
@@ -258,9 +258,6 @@ class SellerAutoService:
     def session_status(self) -> ToolPayload:
         return self._coalesced(self._settle_and_read)
 
-    def submit_captcha_selection(self, indices: list[Any], challenge_id: str = "") -> ToolPayload:
-        return self._guard(self._submit_captcha_selection, indices, challenge_id)
-
     def resume_session(self, session_id: str) -> ToolPayload:
         return self._guard(self._resume_session, session_id)
 
@@ -269,6 +266,11 @@ class SellerAutoService:
             return self._start_export()
         except UrlError as exc:
             return ToolPayload({"ok": False, "status": "error", "message": str(exc)})
+
+    def show_browser(self) -> ToolPayload:
+        """按你的要求把当前页临时切到前台窗口，方便查看。"""
+
+        return self._guard(self._show_browser)
 
     def _guard(self, function: Callable[..., ToolPayload], *args: Any) -> ToolPayload:
         try:
@@ -307,6 +309,41 @@ class SellerAutoService:
         assert self.browser is not None
         return self.browser
 
+    def _show_browser(self) -> ToolPayload:
+        browser = self._ensure_browser()
+        page = browser.detail_page or browser.list_page
+        if page is None:
+            return ToolPayload({"ok": False, "status": "error", "message": "没有可显示的页面"})
+        current = ""
+        try:
+            current = page.url or ""
+        except Exception:
+            current = ""
+        target = ""
+        with self._state_lock:
+            state = self.state or {}
+            product = (state.get("products") or {}).get(state.get("current_product_id") or "") or {}
+            target = str(product.get("ml_search_url") or "")
+        blank = (not current) or current == "about:blank"
+        on_ml = "mercadolibre." in current or "captcha" in current
+        if target and (blank or not on_ml):
+            browser.goto(page, target)
+            page = browser.detail_page or browser.list_page or page
+        shown = browser.reveal(page, "按你的要求打开前台窗口")
+        url = ""
+        try:
+            url = getattr(shown, "url", None) or getattr(page, "url", "") or ""
+        except Exception:
+            url = ""
+        return self._payload(
+            {
+                "ok": True,
+                "status": "browser_shown",
+                "message": "已打开前台窗口，你可以看一下。看完告诉我继续。",
+                "url": url,
+            }
+        )
+
     def _require_state(self) -> dict[str, Any]:
         if self.state is None:
             raise UrlError("还没有会话。请先调用 open_store 或 resume_session")
@@ -344,6 +381,9 @@ class SellerAutoService:
         except Exception:
             log("关闭资料查询浏览器失败")
         self.enrich_browser = None
+        from seller_auto.proxy import stop_local_proxy
+
+        stop_local_proxy()
 
     def _apply_challenge_flag(self) -> None:
         browser = self._ensure_browser()
@@ -419,22 +459,6 @@ class SellerAutoService:
         if image_bytes:
             return ToolPayload(payload.data, list(payload.images) + image_bytes)
         return payload
-
-    def _submit_captcha_selection(self, indices: list[Any], challenge_id: str = "") -> ToolPayload:
-        browser = self._ensure_browser()
-        page = browser.detail_page or browser.list_page
-        if page is None:
-            return ToolPayload({"ok": False, "status": "error", "message": "浏览器还没打开"})
-        chosen: list[int] = []
-        for item in indices or []:
-            try:
-                chosen.append(int(item))
-            except (TypeError, ValueError):
-                continue
-        blocked = browser.apply_captcha_selection(page, chosen, challenge_id or "")
-        if blocked is not None:
-            return self._blocked(blocked)
-        return self._settle_and_read()
 
     def _open_store(self, seller_id: str, product: str = "") -> ToolPayload:
         seller_id, store_url = resolve_store_input(seller_id)
@@ -545,17 +569,13 @@ class SellerAutoService:
         """详情或写表还在进行时就在这里等完。验证和失败直接返回，不再往下走。"""
 
         if self._challenge_pending():
-            paused = self._present_challenge()
-            if paused is not None:
-                return paused
+            return self._verification_payload()
         error_retries = 0
         while True:
             self._kick_sales_if_idle(retry_error=True)
             self._kick_export_if_idle()
             if self._challenge_pending():
-                paused = self._present_challenge()
-                if paused is not None:
-                    return paused
+                return self._verification_payload()
             if self._sales_should_wait():
                 timed_out = self._wait_while(self._sales_should_wait, "同款详情")
                 if self._challenge_pending():
@@ -649,28 +669,6 @@ class SellerAutoService:
                 return True
         with self._flight_mu:
             return self._flight is not None
-
-    def _present_challenge(self) -> ToolPayload | None:
-        """在无头里自主尝试验证；图片题截格返回给模型点选。"""
-
-        browser = self.browser
-        if browser is None or not browser.background:
-            return self._verification_payload()
-        page = browser.detail_page or browser.list_page
-        if page is None:
-            return self._verification_payload()
-        site = browser.challenge_site or "ml"
-
-        def clear() -> dict[str, Any] | None:
-            return browser.ensure_clear(page, site, present=True)
-
-        if threading.current_thread() is self._worker._thread:
-            blocked = clear()
-        else:
-            blocked = self._worker.call(clear)
-        if blocked:
-            return self._blocked(blocked)
-        return None
 
     def _verification_payload(self) -> ToolPayload:
         product_id = ""
@@ -1418,18 +1416,23 @@ class SellerAutoService:
             return "蓝鲸选品已把 30 天销量写入名称。"
         return "蓝鲸选品没有查到这些链接，单量保持原样。"
 
+    def _new_enrich_browser(self) -> ArgentinaBrowser:
+        from seller_auto.exit_identity import china_identity
+
+        identity = china_identity()
+        return ArgentinaBrowser(
+            self.settings,
+            Path(str(self.profile_dir) + "-enrich"),
+            headless=self.headless,
+            locale=identity.locale,
+            accept_language=identity.accept_language,
+            timezone_id=identity.timezone_id,
+            geolocation=identity.geolocation,
+        )
+
     def _ensure_enrich_browser(self) -> ArgentinaBrowser:
         if self.enrich_browser is None:
-            enrich_dir = Path(str(self.profile_dir) + "-enrich")
-            self.enrich_browser = ArgentinaBrowser(
-                self.settings,
-                enrich_dir,
-                headless=self.headless,
-                locale="zh-CN",
-                accept_language="zh-CN,zh;q=0.9",
-                timezone_id="Asia/Shanghai",
-                geolocation={"latitude": 31.2304, "longitude": 121.4737},
-            )
+            self.enrich_browser = self._new_enrich_browser()
         try:
             self.enrich_browser.start()
         except Exception as exc:
@@ -1438,16 +1441,7 @@ class SellerAutoService:
             step("资料", "资料浏览器启动失败，丢掉后重开")
             self._reset_enrich_browser()
             if self.enrich_browser is None:
-                enrich_dir = Path(str(self.profile_dir) + "-enrich")
-                self.enrich_browser = ArgentinaBrowser(
-                    self.settings,
-                    enrich_dir,
-                    headless=self.headless,
-                    locale="zh-CN",
-                    accept_language="zh-CN,zh;q=0.9",
-                    timezone_id="Asia/Shanghai",
-                    geolocation={"latitude": 31.2304, "longitude": 121.4737},
-                )
+                self.enrich_browser = self._new_enrich_browser()
             self.enrich_browser.start()
         assert self.enrich_browser is not None
         return self.enrich_browser
@@ -2917,7 +2911,9 @@ def _http_image(url: str, referer: str) -> bytes:
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    from seller_auto.proxy import open_through_proxy
+
+    with open_through_proxy(request, timeout=20) as response:
         body = response.read()
     if not body:
         raise RuntimeError(f"图片下载失败：空响应 {url}")

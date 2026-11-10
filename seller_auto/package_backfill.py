@@ -8,6 +8,7 @@ from typing import Any
 
 from seller_auto.browser import ArgentinaBrowser
 from seller_auto.browser_launch import snapshot_profile
+from seller_auto.exit_identity import china_identity
 from seller_auto.lingdong import apply_last_mile, collect_market_quotes, quote_jobs
 from seller_auto.matches import known_orders_fields
 from seller_auto.pacing import DelaySettings
@@ -90,14 +91,15 @@ def backfill_packages(
             Path(str(profile_dir) + "-enrich-backfill"),
         )
         step("资料", "回填使用独立浏览器配置，避免关掉正在查询的卖家精灵")
+        identity = china_identity()
         browser = ArgentinaBrowser(
             settings,
             launch_dir,
             headless=settings.headless,
-            locale="zh-CN",
-            accept_language="zh-CN,zh;q=0.9",
-            timezone_id="Asia/Shanghai",
-            geolocation={"latitude": 31.2304, "longitude": 121.4737},
+            locale=identity.locale,
+            accept_language=identity.accept_language,
+            timezone_id=identity.timezone_id,
+            geolocation=identity.geolocation,
         )
         browser.start()
     try:

@@ -77,7 +77,6 @@ def _handle_connection(connection: socket.socket, service: SellerAutoService, wo
             "session_status",
             "submit_listing_matches",
             "submit_ad_matches",
-            "submit_captcha_selection",
         }:
             _run_tool(connection, service, method, request.get("params") or {})
             return

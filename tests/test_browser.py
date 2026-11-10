@@ -156,21 +156,7 @@ class BrowserRecoveryTests(unittest.TestCase):
         reopen.assert_called_once_with(headless=False, urls=[page.url], restore_detail=False)
         self.assertIs(shown, reopened)
 
-    def test_headless_challenge_stays_without_a_window(self) -> None:
-        browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
-        page = mock.Mock()
-        page.url = "https://www.mercadolibre.com.mx/captcha/wall/logged"
-        page.locator.return_value.count.return_value = 0
-        browser.headless = True
-        browser.background = True
-        with mock.patch.object(browser, "_show_for_verification") as show:
-            result = browser.ensure_clear(page, "ml")
-        show.assert_not_called()
-        self.assertTrue(browser.headless)
-        self.assertEqual(result["status"], "needs_human_verification")
-        self.assertIn("没有打开窗口", result["message"])
-
-    def test_presenting_a_challenge_stays_headless(self) -> None:
+    def test_ensure_clear_opens_foreground_and_waits(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
         page = mock.Mock()
         page.url = "https://www.mercadolibre.com.mx/captcha/wall/logged"
@@ -179,78 +165,19 @@ class BrowserRecoveryTests(unittest.TestCase):
         browser.headless = True
         browser.background = True
         with (
-            mock.patch.object(browser, "_show_for_verification") as show,
-            mock.patch.object(browser, "_ensure_headless_for_verification", return_value=page) as ensure,
-            mock.patch.object(browser, "_attempt_verification_clicks") as clicks,
-            mock.patch.object(browser, "needs_verification", side_effect=[True, True, True]),
-            mock.patch.object(browser, "_has_recaptcha_image_challenge", return_value=False),
+            mock.patch.object(browser, "_show_for_verification", return_value=page) as show,
             mock.patch.object(browser, "_wait_until_clear", return_value=False) as wait,
-            mock.patch("seller_auto.browser.time.sleep"),
+            mock.patch.object(browser, "_return_to_background") as hide,
         ):
-            result = browser.ensure_clear(page, "ml", present=True)
-        show.assert_not_called()
-        ensure.assert_called_once_with(page)
-        clicks.assert_called_once()
-        wait.assert_called_once()
+            result = browser.ensure_clear(page, "ml")
+        show.assert_called_once_with(page)
+        wait.assert_called_once_with(page, timeout=90)
+        hide.assert_not_called()
         self.assertEqual(result["status"], "needs_human_verification")
-        self.assertIn("自主验证还没通过", result["message"])
+        self.assertEqual(result["message"], "需要手动验证")
         self.assertTrue(browser.challenge_pending)
-        self.assertTrue(browser.headless)
 
-    def test_presenting_returns_captcha_tiles_for_model(self) -> None:
-        browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
-        page = mock.Mock()
-        page.url = "https://www.mercadolibre.com.mx/captcha/wall/logged"
-        page.locator.return_value.count.return_value = 0
-        browser.list_page = page
-        browser.headless = True
-        browser.background = True
-        tiles = {
-            "ok": False,
-            "status": "needs_captcha_selection",
-            "message": "已出现 reCAPTCHA 图片题",
-            "challenge_id": "abc123",
-            "prompt": "Selecciona todas las imágenes con una boca de incendios",
-            "tile_count": 9,
-            "grid": "3x3",
-            "image_bytes": [("tile_0", b"jpeg")],
-        }
-        with (
-            mock.patch.object(browser, "_show_for_verification") as show,
-            mock.patch.object(browser, "_ensure_headless_for_verification", return_value=page),
-            mock.patch.object(browser, "needs_verification", return_value=True),
-            mock.patch.object(browser, "_has_recaptcha_image_challenge", return_value=True),
-            mock.patch.object(browser, "_image_challenge_payload", return_value=tiles) as capture,
-            mock.patch.object(browser, "_wait_until_clear") as wait,
-            mock.patch.object(browser, "_attempt_verification_clicks") as clicks,
-        ):
-            result = browser.ensure_clear(page, "ml", present=True)
-        show.assert_not_called()
-        wait.assert_not_called()
-        clicks.assert_not_called()
-        capture.assert_called_once_with(page)
-        self.assertEqual(result["status"], "needs_captcha_selection")
-        self.assertEqual(result["challenge_id"], "abc123")
-        self.assertIn("图片题", result["message"])
-
-    def test_image_challenge_stops_auto_clicks(self) -> None:
-        browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
-        page = mock.Mock()
-        browser.list_page = page
-        with (
-            mock.patch.object(browser, "needs_verification", return_value=True),
-            mock.patch.object(browser, "_has_recaptcha_image_challenge", return_value=True),
-            mock.patch.object(browser, "_attempt_verification_clicks") as clicks,
-            mock.patch.object(browser, "_reload_verification") as reload,
-            mock.patch("seller_auto.browser.time.sleep"),
-            mock.patch("seller_auto.browser.time.monotonic", side_effect=[0, 1, 2, 3, 4, 5]),
-        ):
-            cleared = browser._wait_until_clear(page, timeout=10, attempt=True)
-        self.assertFalse(cleared)
-        clicks.assert_not_called()
-        reload.assert_not_called()
-
-    def test_presenting_a_challenge_clears_when_autonomous_verify_succeeds(self) -> None:
+    def test_ensure_clear_returns_to_background_when_cleared(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
         page = mock.Mock()
         page.url = "https://www.mercadolibre.com.mx/captcha/wall/logged"
@@ -260,78 +187,16 @@ class BrowserRecoveryTests(unittest.TestCase):
         browser.background = True
         browser.challenge_pending = True
         with (
-            mock.patch.object(browser, "_show_for_verification") as show,
-            mock.patch.object(browser, "_ensure_headless_for_verification", return_value=page),
-            mock.patch.object(browser, "_attempt_verification_clicks"),
-            mock.patch.object(browser, "needs_verification", side_effect=[True, False]),
-            mock.patch.object(browser, "_has_recaptcha_image_challenge", return_value=False),
+            mock.patch.object(browser, "_show_for_verification", return_value=page) as show,
+            mock.patch.object(browser, "_wait_until_clear", return_value=True),
+            mock.patch.object(browser, "_return_to_background") as hide,
             mock.patch.object(browser, "_reward_if_cleared", return_value=None) as reward,
-            mock.patch("seller_auto.browser.time.sleep"),
         ):
-            result = browser.ensure_clear(page, "ml", present=True)
-        show.assert_not_called()
-        self.assertIsNone(result)
+            result = browser.ensure_clear(page, "ml")
+        show.assert_called_once_with(page)
+        hide.assert_called_once_with(page)
         reward.assert_called_once_with("ml")
-
-    def test_apply_captcha_selection_clicks_tiles_and_clears(self) -> None:
-        browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
-        page = mock.Mock()
-        browser.list_page = page
-        browser.headless = True
-        browser.challenge_pending = True
-        browser.challenge_site = "ml"
-        browser.captcha_challenge_id = "cid1"
-        frame = mock.Mock()
-        tiles = mock.Mock()
-        tiles.count.return_value = 9
-        tile = mock.Mock()
-        tiles.nth.return_value = tile
-        with (
-            mock.patch.object(browser, "_ensure_headless_for_verification", return_value=page),
-            mock.patch.object(browser, "needs_verification", side_effect=[True, False]),
-            mock.patch.object(browser, "_has_recaptcha_image_challenge", return_value=True),
-            mock.patch.object(browser, "_recaptcha_bframe", return_value=frame),
-            mock.patch.object(browser, "_recaptcha_tiles", return_value=tiles),
-            mock.patch.object(browser, "_click_recaptcha_verify", return_value=True),
-            mock.patch.object(browser, "_reward_if_cleared", return_value=None) as reward,
-            mock.patch("seller_auto.browser.time.sleep"),
-        ):
-            result = browser.apply_captcha_selection(page, [1, 4], "cid1")
         self.assertIsNone(result)
-        self.assertEqual(tiles.nth.call_count, 2)
-        reward.assert_called_once_with("ml")
-
-    def test_apply_captcha_selection_returns_new_tiles_when_still_blocked(self) -> None:
-        browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
-        page = mock.Mock()
-        browser.list_page = page
-        browser.headless = True
-        browser.challenge_pending = True
-        browser.captcha_challenge_id = "cid1"
-        frame = mock.Mock()
-        tiles = mock.Mock()
-        tiles.count.return_value = 9
-        tiles.nth.return_value = mock.Mock()
-        again = {
-            "ok": False,
-            "status": "needs_captcha_selection",
-            "challenge_id": "cid2",
-            "image_bytes": [("tile_0", b"x")],
-            "message": "图片题",
-        }
-        with (
-            mock.patch.object(browser, "_ensure_headless_for_verification", return_value=page),
-            mock.patch.object(browser, "needs_verification", return_value=True),
-            mock.patch.object(browser, "_has_recaptcha_image_challenge", return_value=True),
-            mock.patch.object(browser, "_recaptcha_bframe", return_value=frame),
-            mock.patch.object(browser, "_recaptcha_tiles", return_value=tiles),
-            mock.patch.object(browser, "_click_recaptcha_verify", return_value=True),
-            mock.patch.object(browser, "_image_challenge_payload", return_value=again),
-            mock.patch("seller_auto.browser.time.sleep"),
-        ):
-            result = browser.apply_captcha_selection(page, [0], "cid1")
-        self.assertEqual(result["status"], "needs_captcha_selection")
-        self.assertEqual(browser.captcha_fail_count, 1)
 
     def test_reveal_window_does_not_activate(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))

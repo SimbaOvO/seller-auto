@@ -12,10 +12,8 @@ from unittest import mock
 
 from seller_auto.browser_launch import (
     STEALTH_JS,
-    RECAPTCHA_CDN_FIX_JS,
     apply_stealth,
     automation_stealth,
-    install_recaptcha_cdn_fix,
     _CHROME_COMMANDS_SCRIPT,
     _PROFILE_PIDS,
     _decode_process_row,
@@ -51,9 +49,15 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertNotIn("--window-position=-32000,-32000", options["args"])
         self.assertIn("--enable-automation", options["ignore_default_args"])
         self.assertIn("--disable-blink-features=AutomationControlled", options["args"])
-        self.assertIn("--no-proxy-server", options["args"])
-        self.assertNotIn("proxy", options)
-        self.assertEqual(options["locale"], "es-AR")
+        self.assertNotIn("--no-proxy-server", options["args"])
+        self.assertEqual(options["proxy"]["server"], "http://127.0.0.1:17910")
+        self.assertNotIn("username", options["proxy"])
+        self.assertNotIn("password", options["proxy"])
+        self.assertEqual(options["locale"], "zh-CN")
+        self.assertEqual(options["timezone_id"], "Asia/Shanghai")
+        self.assertEqual(options["geolocation"], {"latitude": 31.2304, "longitude": 121.4737})
+        self.assertEqual(options["extra_http_headers"]["Accept-Language"], "zh-CN,zh;q=0.9,en;q=0.8")
+        self.assertIn("--lang=zh-CN", options["args"])
         self.assertNotIn("canvas", STEALTH_JS.lower())
         self.assertNotIn("webgl", STEALTH_JS.lower())
         self.assertNotIn("webdriver", STEALTH_JS)
@@ -66,13 +70,6 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertIn("webdriver", stealth.script_payload)
         self.assertNotIn("loading webgl.vendor.js", stealth.script_payload)
         self.assertNotIn("loading navigator.platform.js", stealth.script_payload)
-
-    def test_recaptcha_cdn_fix_rewrites_gstatic_cn(self) -> None:
-        context = mock.Mock()
-        install_recaptcha_cdn_fix(context)
-        context.add_init_script.assert_called_once_with(RECAPTCHA_CDN_FIX_JS)
-        self.assertIn(r"gstatic\.cn", RECAPTCHA_CDN_FIX_JS)
-        self.assertIn("gstatic.com", RECAPTCHA_CDN_FIX_JS)
 
     def test_apply_stealth_injects_webdriver_script(self) -> None:
         class Context:

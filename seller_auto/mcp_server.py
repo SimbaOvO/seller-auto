@@ -29,13 +29,13 @@ INSTRUCTIONS = """
 
 每个 ASIN 的顺序：set_keywords 会直接返回第一批列表图 → submit_listing_matches → 广告图由提交的返回带上。整店里服务会自己写表，再在同一次返回里打开下一条。
 打开商品后立刻 set_keywords 去美客多比对。卖家精灵查包装，并在该行下方点击「1688找货源」读取货源均价，由后台另一条浏览器并行完成，不要等它们结束。看列表图或广告图时，服务会在同一条美客多浏览器上提前抓下一页，风控间隔不变。列表和广告都结束后服务自己写表，不要调用 export_results。写表前会等卖家精灵和货源结束。蓝鲸选品暂时不查，名称不写单量。FBA 运费用卖家精灵的重量和长宽高，按美客多运费表和同款最低售价计算后写入。没有同款、也没有相似度大于 0.6 的有销量链接时，才不写入表格。不要自己打开蓝鲸。
-提交的返回里已经是下一步要看的列表图、广告图、下一张亚马逊主图，或结束时，直接判断。没有下一批列表图、同款详情还在打开时，提交会马上返回，不要在这次提交里干等。返回说判断已记录、详情还在打开时，调用一次 session_status。它最多等大约一分半，然后带回下一步，或写明还剩几条并请再调用一次。提交如果超时，判断已经记下，不要把同一批再提交一次，改调用 session_status。不要连续空查，也不要在详情还在打开时调用 next_listing_batch 或 next_ad_batch。返回要求验证时：立刻调用一次 session_status；服务保持无头，自主点击「No soy un robot」和可点的继续。若返回 needs_captcha_selection 和 tile_N 图，看题干后调用 submit_captcha_selection(indices, challenge_id) 提交要点的格子（索引从 0 起、按行优先）；提交后若仍返回格子图就继续选。不要打开前台窗口，不要用桌面点击去过验证码，不要为了验证重开浏览器。多次仍过不去或需要登录时再找用户。如果图丢了，再调用一次 next_listing_batch 或 next_ad_batch，会把还没判断的同一批发回来。不要调用 export_results 或 next_amazon_product。
+提交的返回里已经是下一步要看的列表图、广告图、下一张亚马逊主图，或结束时，直接判断。没有下一批列表图、同款详情还在打开时，提交会马上返回，不要在这次提交里干等。返回说判断已记录、详情还在打开时，调用一次 session_status。它最多等大约一分半，然后带回下一步，或写明还剩几条并请再调用一次。提交如果超时，判断已经记下，不要把同一批再提交一次，改调用 session_status。不要连续空查，也不要在详情还在打开时调用 next_listing_batch 或 next_ad_batch。只有返回明确要求手动验证时，才在前台完成后调用一次 session_status。如果图丢了，再调用一次 next_listing_batch 或 next_ad_batch，会把还没判断的同一批发回来。不要调用 export_results 或 next_amazon_product。
 整店下一次返回已经是下一张主图时，直接 set_keywords，直到返回 end_of_store。单品返回结束后不要再翻店铺。
 
 关键词去掉品牌、尺寸、重量、数量、颜色和空泛用途，保留 “para + 物品”。调用 set_keywords 时同时给出 chinese_name：根据商品标题译成简短中文名，例如「折叠购物车」。表格里的名称用这个中文名，SKU 用关键词。
 比对标准：颜色不同仍然可以算同一商品。外形、结构和整体构图必须高度相似才是同款。只是同一大类、外形明显不同的，similar 必须为 false。标题已经能明显看出不是同一商品的，直接记 false，不要再看图。图已经明显不是同款的，由你记 false。confidence 从 0 到 1，不低于 0.8 才进入筛选。亚马逊主图是圆形支架、候选是矩形，构图不同但用途和功能相同，且相似度不低于 0.8 时，记 similar=false、relation="functional"。容量、重量、尺寸、体积、功率这类单位对不上，但整体用途相同，且相似度不低于 0.8 时，记 similar=false、relation="spec"。不要把这两类并进同款。有销量的各自统计，表格各开一行，名称分别写成「中文名（矩形）」和「中文名（规格）」。没销量的也记下这条候选自己的链接，供人工复核。矩形相似和规格不同不打开详情，也不访问广告位。同款仍打开详情抓广告。同款、矩形相似和规格不同各自维护销量前 10，互不挤占。判成同款后：广告卡片已经写了 vendidos 的不再打开详情。列表同款仍打开详情抓全量广告；广告商品详情不再读取里面的广告。卡片或详情销量挤不进前 10 的直接跳过，这里的前 10 只和自己那一池比较。详情没有 vendido 的不记录。写表时同款、矩形相似、规格不同各取 10 条。服务端只记录你提交的 similar 和 relation，不会把未判断或同款改成 false。服务端按标题跳过的候选已经记成 false，不用再提交。
 
-工具会等待十几秒到几十秒，这是风控间隔。提交不等全部详情开完。session_status 在等同款详情时最多大约一分半就会返回。不要因为提交超时把同一批再交一次。返回要求验证时：立刻调用一次 session_status；图片题用 submit_captcha_selection，不要桌面点击过验证码。浏览器最多两个标签。
+工具会等待十几秒到几十秒，这是风控间隔。提交不等全部详情开完。session_status 在等同款详情时最多大约一分半就会返回。不要因为提交超时把同一批再交一次。需要手动验证时，在前台窗口完成后重试同一个工具。浏览器最多两个标签。
 """.strip()
 
 
@@ -121,20 +121,9 @@ def build_server(service: SellerAutoService | None = None) -> MCPServer:
 
     @server.tool(structured_output=False)
     def session_status() -> list[Any]:
-        """等一会儿同款详情或写表。最多大约一分半就返回：要么是下一步的图、主图或结束，要么写明还剩几条。不要连续反复调用。新任务开始时不要调用。需要验证时：在无头里点勾选框；若返回 needs_captcha_selection，改调 submit_captcha_selection。"""
+        """等一会儿同款详情或写表。最多大约一分半就返回：要么是下一步的图、主图或结束，要么写明还剩几条。不要连续反复调用。新任务开始时不要调用。需要手动验证时，在前台窗口完成后调用一次。"""
 
         return _blocks(invoke("session_status"))
-
-    @server.tool(structured_output=False)
-    def submit_captcha_selection(
-        indices: Annotated[list[int], Field(description="要点的格子索引，从 0 起按行优先，可多选")],
-        challenge_id: Annotated[str, Field(description="上一次返回的 challenge_id")] = "",
-    ) -> list[Any]:
-        """提交 reCAPTCHA 图片题选中的格子。服务在无头 iframe 里点击并 VERIFICAR。若仍返回格子图，继续选；通过后带回下一步。"""
-
-        return _blocks(
-            invoke("submit_captcha_selection", indices=indices, challenge_id=challenge_id)
-        )
 
     @server.tool(structured_output=False)
     def resume_session(session_id: str) -> list[Any]:
