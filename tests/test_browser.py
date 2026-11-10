@@ -59,6 +59,7 @@ class BrowserRecoveryTests(unittest.TestCase):
                 "seller_auto.browser.persistent_context_options",
                 return_value={"user_data_dir": "/tmp/seller-auto-dead"},
             ) as options,
+            mock.patch("seller_auto.proxy.ensure_local_proxy"),
             mock.patch("playwright.sync_api.sync_playwright") as sync_playwright,
             mock.patch("seller_auto.browser.apply_stealth") as stealth,
         ):
@@ -71,6 +72,7 @@ class BrowserRecoveryTests(unittest.TestCase):
         version.assert_called_once_with(Path("/tmp/browsers"))
         self.assertEqual(options.call_args.kwargs["chrome_version"], "156.0.8078.4")
         self.assertTrue(options.call_args.kwargs["headless"])
+        self.assertTrue(options.call_args.kwargs["use_proxy"])
 
     def test_search_grid_is_not_a_verification_page(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
@@ -123,16 +125,13 @@ class BrowserRecoveryTests(unittest.TestCase):
         browser._window_shown = False
         with (
             mock.patch("seller_auto.browser.context_is_alive", return_value=True),
-            mock.patch("seller_auto.browser._chrome_for_testing_running", return_value=True),
             mock.patch.object(browser, "_reopen") as reopen,
             mock.patch.object(browser, "_reveal_window") as reveal,
-            mock.patch.object(browser, "_activate_chrome", return_value=True) as activate,
         ):
             shown = browser._show_for_verification(page)
         self.assertIs(shown, page)
         reopen.assert_not_called()
         reveal.assert_called_once_with(page)
-        activate.assert_called_once()
 
     def test_headed_verification_reopens_when_window_was_closed(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
@@ -146,9 +145,8 @@ class BrowserRecoveryTests(unittest.TestCase):
         reopened.url = page.url
         with (
             mock.patch("seller_auto.browser.context_is_alive", return_value=False),
-            mock.patch("seller_auto.browser._chrome_for_testing_running", return_value=False),
             mock.patch.object(browser, "_reopen") as reopen,
-            mock.patch.object(browser, "_activate_chrome", return_value=True),
+            mock.patch.object(browser, "_reveal_window"),
             mock.patch.object(browser, "_urls_to_restore", return_value=[page.url]),
         ):
             browser.list_page = reopened
@@ -198,20 +196,48 @@ class BrowserRecoveryTests(unittest.TestCase):
         reward.assert_called_once_with("ml")
         self.assertIsNone(result)
 
-    def test_reveal_window_does_not_activate(self) -> None:
+    def test_reveal_window_comes_to_the_front(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))
         page = mock.Mock()
         browser.headless = False
+        browser.list_page = page
         browser._window_shown = False
         with (
             mock.patch("seller_auto.browser._chrome_for_testing_visible", return_value=True) as visible,
             mock.patch.object(browser, "_place_bounds", return_value=False),
-            mock.patch.object(page, "bring_to_front") as front,
+            mock.patch.object(browser, "_browser_pid", return_value=4321),
         ):
             browser._reveal_window(page)
-        visible.assert_called_once_with(True)
-        front.assert_not_called()
+        visible.assert_called_once_with(True, 4321)
+        page.bring_to_front.assert_called_once()
         self.assertTrue(browser._window_shown)
+
+    def test_direct_browser_does_not_start_the_proxy(self) -> None:
+        browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"), use_proxy=False)
+        alive = mock.Mock()
+        alive.pages = []
+        page = mock.Mock()
+        page.is_closed.return_value = False
+        alive.new_page.return_value = page
+        playwright = mock.Mock()
+        playwright.chromium.launch_persistent_context.return_value = alive
+        with (
+            mock.patch.object(browser, "_wait_until_profile_free"),
+            mock.patch("seller_auto.browser.mark_clean_shutdown", return_value=False),
+            mock.patch("seller_auto.browser.use_playwright_browsers", return_value=Path("/tmp/browsers")),
+            mock.patch("seller_auto.browser.read_chromium_version", return_value="156.0.8078.4"),
+            mock.patch(
+                "seller_auto.browser.persistent_context_options",
+                return_value={"user_data_dir": "/tmp/seller-auto-dead"},
+            ) as options,
+            mock.patch("seller_auto.proxy.ensure_local_proxy") as proxy,
+            mock.patch("playwright.sync_api.sync_playwright") as sync_playwright,
+            mock.patch("seller_auto.browser.apply_stealth"),
+        ):
+            sync_playwright.return_value.start.return_value = playwright
+            browser.start()
+        proxy.assert_not_called()
+        self.assertFalse(options.call_args.kwargs["use_proxy"])
 
     def test_reopen_writes_cookies_into_the_new_browser(self) -> None:
         browser = ArgentinaBrowser(DelaySettings(), Path("/tmp/seller-auto-dead"))

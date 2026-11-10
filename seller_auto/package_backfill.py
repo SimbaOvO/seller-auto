@@ -100,6 +100,7 @@ def backfill_packages(
             accept_language=identity.accept_language,
             timezone_id=identity.timezone_id,
             geolocation=identity.geolocation,
+            use_proxy=False,
         )
         browser.start()
     try:

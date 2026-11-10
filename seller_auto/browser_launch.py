@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from seller_auto.exit_identity import (
-    CHINA_ACCEPT_LANGUAGE,
-    CHINA_GEOLOCATION,
-    CHINA_LOCALE,
-    CHINA_TIMEZONE_ID,
+    ARGENTINA_ACCEPT_LANGUAGE,
+    ARGENTINA_GEOLOCATION,
+    ARGENTINA_LOCALE,
+    ARGENTINA_TIMEZONE_ID,
 )
 from seller_auto.proxy import browser_proxy
 from seller_auto.step_log import step
@@ -61,7 +61,7 @@ LAUNCH_ARGS = [
     "--disable-session-crashed-bubble",
     "--disable-blink-features=AutomationControlled",
     "--window-size=1440,900",
-    f"--lang={CHINA_LOCALE}",
+    f"--lang={ARGENTINA_LOCALE}",
 ]
 
 _CHROME_GLOBS = (
@@ -437,12 +437,37 @@ def command_uses_profile(command: str, profile: Path) -> bool:
         return False
     if _windows_path_key(raw) == _windows_path_key(profile):
         return True
-    if sys.platform != "win32":
+    if sys.platform not in {"win32", "darwin"}:
         return False
     try:
         return Path(raw).resolve() == profile.resolve()
     except OSError:
         return False
+
+
+def _darwin_chrome_commands() -> list[tuple[int, str]]:
+    """macOS 上按完整命令行找出 Chrome 主进程。ps 不加 ww 会把 user-data-dir 截掉。"""
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    rows: list[tuple[int, str]] = []
+    for line in (completed.stdout or "").splitlines():
+        stripped = line.strip()
+        pid_text, _, command = stripped.partition(" ")
+        if not pid_text.isdigit() or not command or "--type=" in command.lower():
+            continue
+        if "--user-data-dir" not in command:
+            continue
+        rows.append((int(pid_text), command))
+    return rows
 
 
 def _decode_process_row(line: str) -> tuple[int, str] | None:
@@ -464,6 +489,8 @@ def chrome_browser_commands() -> list[tuple[int, str]]:
     命令行在 PowerShell 里是 UTF-16，打成 Base64 再输出。这样中文路径不会经过系统代码页。
     """
 
+    if sys.platform == "darwin":
+        return _darwin_chrome_commands()
     if sys.platform != "win32":
         return []
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
@@ -646,29 +673,33 @@ def persistent_context_options(
     *,
     headless: bool,
     chrome_version: str | None = None,
-    locale: str = CHINA_LOCALE,
-    accept_language: str = CHINA_ACCEPT_LANGUAGE,
-    timezone_id: str = CHINA_TIMEZONE_ID,
+    locale: str = ARGENTINA_LOCALE,
+    accept_language: str = ARGENTINA_ACCEPT_LANGUAGE,
+    timezone_id: str = ARGENTINA_TIMEZONE_ID,
     geolocation: dict[str, float] | None = None,
+    use_proxy: bool = True,
 ) -> dict[str, Any]:
     """后台用完整 Chrome 的无头模式。不传 channel 时，Playwright 会改用精简的 headless shell。"""
 
     args = [item for item in LAUNCH_ARGS if not item.startswith("--lang=")]
     args.append(f"--lang={locale}")
+    if not use_proxy:
+        args.append("--no-proxy-server")
     options: dict[str, Any] = {
         "user_data_dir": str(profile_dir.resolve()),
         "headless": headless,
         "channel": "chrome-for-testing",
         "locale": locale,
         "timezone_id": timezone_id,
-        "geolocation": dict(geolocation or CHINA_GEOLOCATION),
+        "geolocation": dict(geolocation or ARGENTINA_GEOLOCATION),
         "permissions": ["geolocation"],
         "viewport": {"width": 1440, "height": 900},
         "extra_http_headers": {"Accept-Language": accept_language},
         "ignore_default_args": ["--enable-automation"],
-        "proxy": browser_proxy(),
         "args": args,
     }
+    if use_proxy:
+        options["proxy"] = browser_proxy()
     if headless and chrome_version:
         options["user_agent"] = desktop_chrome_user_agent(chrome_version)
     return options

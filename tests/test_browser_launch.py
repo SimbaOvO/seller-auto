@@ -53,11 +53,11 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertEqual(options["proxy"]["server"], "http://127.0.0.1:17910")
         self.assertNotIn("username", options["proxy"])
         self.assertNotIn("password", options["proxy"])
-        self.assertEqual(options["locale"], "zh-CN")
-        self.assertEqual(options["timezone_id"], "Asia/Shanghai")
-        self.assertEqual(options["geolocation"], {"latitude": 31.2304, "longitude": 121.4737})
-        self.assertEqual(options["extra_http_headers"]["Accept-Language"], "zh-CN,zh;q=0.9,en;q=0.8")
-        self.assertIn("--lang=zh-CN", options["args"])
+        self.assertEqual(options["locale"], "es-AR")
+        self.assertEqual(options["timezone_id"], "America/Argentina/Buenos_Aires")
+        self.assertEqual(options["geolocation"], {"latitude": -34.6037, "longitude": -58.3816})
+        self.assertEqual(options["extra_http_headers"]["Accept-Language"], "es-AR,es;q=0.9,en;q=0.8")
+        self.assertIn("--lang=es-AR", options["args"])
         self.assertNotIn("canvas", STEALTH_JS.lower())
         self.assertNotIn("webgl", STEALTH_JS.lower())
         self.assertNotIn("webdriver", STEALTH_JS)
@@ -97,6 +97,21 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertNotIn("user_agent", options)
         self.assertNotIn("--window-position=-32000,-32000", options["args"])
 
+    def test_direct_context_does_not_use_the_proxy(self) -> None:
+        options = persistent_context_options(
+            Path("/tmp/seller-auto-data/profile"),
+            headless=True,
+            use_proxy=False,
+            locale="zh-CN",
+            accept_language="zh-CN,zh;q=0.9,en;q=0.8",
+            timezone_id="Asia/Shanghai",
+            geolocation={"latitude": 31.2304, "longitude": 121.4737},
+        )
+        self.assertNotIn("proxy", options)
+        self.assertIn("--no-proxy-server", options["args"])
+        self.assertEqual(options["locale"], "zh-CN")
+        self.assertIn("--lang=zh-CN", options["args"])
+
     def test_profile_match_ignores_the_enrich_browser(self) -> None:
         profile = Path("E:/seller-auto/data/profile")
         enrich = Path("E:/seller-auto/data/profile-enrich")
@@ -112,6 +127,18 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertFalse(command_uses_profile(quoted, Path("C:/Users/Wang Xi/seller-auto/data/profile-enrich")))
         extended = r"chrome.exe --user-data-dir=\\?\E:\seller-auto\data\profile"
         self.assertTrue(command_uses_profile(extended, profile))
+        mac_profile = Path("/Users/me/seller-auto/data/profile")
+        mac_command = (
+            "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing "
+            "--user-data-dir=/Users/me/seller-auto/data/profile --remote-debugging-pipe"
+        )
+        self.assertTrue(command_uses_profile(mac_command, mac_profile))
+        self.assertFalse(
+            command_uses_profile(
+                mac_command.replace("/data/profile", "/data/profile-enrich", 1),
+                mac_profile,
+            )
+        )
 
     def test_read_chromium_version_from_plist(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

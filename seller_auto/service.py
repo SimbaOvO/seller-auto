@@ -568,17 +568,17 @@ class SellerAutoService:
     def _wait_for_background(self) -> ToolPayload | None:
         """详情或写表还在进行时就在这里等完。验证和失败直接返回，不再往下走。"""
 
-        if self._challenge_pending():
+        if self._present_challenge():
             return self._verification_payload()
         error_retries = 0
         while True:
             self._kick_sales_if_idle(retry_error=True)
             self._kick_export_if_idle()
-            if self._challenge_pending():
+            if self._present_challenge():
                 return self._verification_payload()
             if self._sales_should_wait():
                 timed_out = self._wait_while(self._sales_should_wait, "同款详情")
-                if self._challenge_pending():
+                if self._present_challenge():
                     return self._verification_payload()
                 if timed_out:
                     return self._background_timeout_payload("sales")
@@ -646,6 +646,35 @@ class SellerAutoService:
     def _challenge_pending(self) -> bool:
         with self._state_lock:
             return bool(self.state and self.state.get("challenge_pending"))
+
+    def _present_challenge(self) -> bool:
+        """验证还在就把窗口调到前台。页面已经通过则清掉标记。"""
+
+        if not self._challenge_pending():
+            return False
+        if self.browser is None:
+            return True
+        try:
+            self._worker.call(self._present_challenge_browser)
+        except Exception:
+            log("打开验证窗口失败")
+        return self._challenge_pending()
+
+    def _present_challenge_browser(self) -> None:
+        browser = self.browser
+        if browser is None:
+            return
+        page = browser.live_page(browser.detail_page or browser.list_page)
+        if page is None:
+            return
+        if browser.needs_verification(page):
+            browser._show_for_verification(page)
+            log("需要手动验证，请在前台窗口里完成")
+            return
+        browser._reward_if_cleared(browser.challenge_site or "ml")
+        if browser.background and not browser.headless:
+            browser._return_to_background(page)
+        self._save()
 
     def _sales_pending_now(self) -> bool:
         with self._state_lock:
@@ -1246,6 +1275,25 @@ class SellerAutoService:
             browser.pause_amazon_read()
         return self._save_opened_amazon_product(browser, page, opened_new_tab, entry)
 
+    def _skip_untitled_product(
+        self,
+        browser: ArgentinaBrowser,
+        opened_new_tab: bool,
+        state: dict[str, Any],
+        entry: dict[str, Any],
+    ) -> ToolPayload:
+        self._mark_visited(entry["key"])
+        self._leave_amazon_detail(browser, opened_new_tab, state)
+        self._save()
+        return self._payload(
+            {
+                "ok": False,
+                "status": "error",
+                "message": "没有读到商品标题，已跳过这一条",
+                "url": entry["href"],
+            }
+        )
+
     def _save_opened_amazon_product(
         self,
         browser: ArgentinaBrowser,
@@ -1258,22 +1306,15 @@ class SellerAutoService:
             page.wait_for_selector("#productTitle", timeout=15000)
         except Exception:
             if browser.needs_verification(page):
-                browser.challenge_pending = True
-                browser.challenge_site = "amazon"
-                return self._blocked(
-                    {"ok": False, "status": "needs_human_verification", "message": NEEDS_HUMAN, "url": page.url}
-                )
-            self._mark_visited(entry["key"])
-            self._leave_amazon_detail(browser, opened_new_tab, state)
-            self._save()
-            return self._payload(
-                {
-                    "ok": False,
-                    "status": "error",
-                    "message": "没有读到商品标题，已跳过这一条",
-                    "url": entry["href"],
-                }
-            )
+                blocked = browser.ensure_clear(page, "amazon")
+                if blocked:
+                    return self._blocked(blocked)
+                try:
+                    page.wait_for_selector("#productTitle", timeout=15000)
+                except Exception:
+                    return self._skip_untitled_product(browser, opened_new_tab, state, entry)
+            else:
+                return self._skip_untitled_product(browser, opened_new_tab, state, entry)
         product = read_product(page)
         key = product["asin"] or entry["key"]
         self._mark_visited(entry["key"])
@@ -1428,6 +1469,7 @@ class SellerAutoService:
             accept_language=identity.accept_language,
             timezone_id=identity.timezone_id,
             geolocation=identity.geolocation,
+            use_proxy=False,
         )
 
     def _ensure_enrich_browser(self) -> ArgentinaBrowser:

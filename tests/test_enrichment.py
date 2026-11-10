@@ -33,6 +33,15 @@ def _product_state() -> dict:
 
 
 class EnrichmentTests(unittest.TestCase):
+    def test_enrich_browser_stays_in_china_and_skips_the_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = SellerAutoService(DelaySettings(), output_dir=directory)
+            browser = service._new_enrich_browser()
+        self.assertFalse(browser.use_proxy)
+        self.assertEqual(browser.locale, "zh-CN")
+        self.assertEqual(browser.timezone_id, "Asia/Shanghai")
+        self.assertEqual(browser.geolocation, {"latitude": 31.2304, "longitude": 121.4737})
+
     def test_schedule_returns_before_lookup_finishes(self) -> None:
         release = threading.Event()
         with tempfile.TemporaryDirectory() as directory:

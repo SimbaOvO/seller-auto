@@ -1,6 +1,6 @@
 import unittest
 
-from seller_auto.exit_identity import china_identity, resolve_exit_identity
+from seller_auto.exit_identity import argentina_identity, china_identity, resolve_exit_identity
 
 
 class ExitIdentityTests(unittest.TestCase):
@@ -14,11 +14,16 @@ class ExitIdentityTests(unittest.TestCase):
         self.assertAlmostEqual(identity.geolocation["latitude"], 31.2304)
         self.assertAlmostEqual(identity.geolocation["longitude"], 121.4737)
 
-    def test_resolve_does_not_follow_exit_country(self) -> None:
-        identity = resolve_exit_identity()
-        self.assertEqual(identity.locale, "zh-CN")
-        self.assertEqual(identity.timezone_id, "Asia/Shanghai")
-        self.assertEqual(identity.source, "china")
+    def test_main_browser_uses_argentina(self) -> None:
+        identity = argentina_identity()
+        self.assertEqual(identity.country, "AR")
+        self.assertEqual(identity.city, "Buenos Aires")
+        self.assertEqual(identity.locale, "es-AR")
+        self.assertEqual(identity.timezone_id, "America/Argentina/Buenos_Aires")
+        resolved = resolve_exit_identity()
+        self.assertEqual(resolved.locale, "es-AR")
+        self.assertEqual(resolved.timezone_id, "America/Argentina/Buenos_Aires")
+        self.assertEqual(resolved.source, "argentina")
 
 
 if __name__ == "__main__":

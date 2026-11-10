@@ -1,4 +1,4 @@
-"""中国语言、时区和地理位置的浏览器，以及最多两个标签。"""
+"""最多两个标签的浏览器。主浏览器跟阿根廷出口；卖家精灵浏览器用中国环境并直连。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from seller_auto.browser_launch import (
     STEALTH_JS,
+    _pids_for_profile,
     apply_stealth,
     mark_clean_shutdown,
     persistent_context_options,
@@ -18,7 +19,11 @@ from seller_auto.browser_launch import (
     read_chromium_version,
     use_playwright_browsers,
 )
-from seller_auto.exit_identity import CHINA_ACCEPT_LANGUAGE, CHINA_LOCALE, CHINA_TIMEZONE_ID
+from seller_auto.exit_identity import (
+    ARGENTINA_ACCEPT_LANGUAGE,
+    ARGENTINA_LOCALE,
+    ARGENTINA_TIMEZONE_ID,
+)
 from seller_auto.pacing import Cooldown, DelaySettings
 from seller_auto.urls import looks_like_verification_url, text_looks_blocked
 
@@ -41,38 +46,28 @@ def log(message: str) -> None:
     step("浏览器", message)
 
 
-def _chrome_for_testing_running() -> bool:
-    """本机是否还有 Google Chrome for Testing 进程。"""
-
-    if sys.platform != "darwin":
-        return True
-    try:
-        completed = subprocess.run(
-            [
-                "osascript",
-                "-e",
-                'tell application "System Events" to (exists process "Google Chrome for Testing")',
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return completed.returncode == 0 and completed.stdout.strip().lower() == "true"
+def _chrome_process_target(pid: int | None) -> str:
+    if pid:
+        return f"first process whose unix id is {int(pid)}"
+    return 'process "Google Chrome for Testing"'
 
 
-def _chrome_for_testing_visible(shown: bool) -> bool:
-    """隐藏或显示正在跑的 Chrome for Testing。进程保持打开，显示时不 activate，避免抢前台。"""
+def _chrome_for_testing_visible(shown: bool, pid: int | None = None) -> bool:
+    """隐藏或显示指定的 Chrome for Testing。有两只浏览器时按进程号区分，避免把卖家精灵那只调到前面。"""
 
     if sys.platform != "darwin":
         return False
+    target = _chrome_process_target(pid)
     if shown:
-        # 只设可见，不 activate，让验证像无头一样不影响用户当前窗口。
-        script = 'tell application "System Events" to set visible of process "Google Chrome for Testing" to true'
+        script = (
+            'tell application "System Events"\n'
+            f"set browserProcess to {target}\n"
+            "set visible of browserProcess to true\n"
+            "set frontmost of browserProcess to true\n"
+            "end tell"
+        )
     else:
-        script = 'tell application "System Events" to set visible of process "Google Chrome for Testing" to false'
+        script = f'tell application "System Events" to set visible of ({target}) to false'
     try:
         completed = subprocess.run(
             ["osascript", "-e", script],
@@ -123,10 +118,11 @@ class ArgentinaBrowser:
         settings: DelaySettings,
         profile_dir: Path,
         headless: bool = True,
-        locale: str = CHINA_LOCALE,
-        accept_language: str = CHINA_ACCEPT_LANGUAGE,
-        timezone_id: str = CHINA_TIMEZONE_ID,
+        locale: str = ARGENTINA_LOCALE,
+        accept_language: str = ARGENTINA_ACCEPT_LANGUAGE,
+        timezone_id: str = ARGENTINA_TIMEZONE_ID,
         geolocation: dict[str, float] | None = None,
+        use_proxy: bool = True,
     ) -> None:
         self.settings = settings
         self.profile_dir = profile_dir
@@ -136,6 +132,7 @@ class ArgentinaBrowser:
         self.accept_language = accept_language
         self.timezone_id = timezone_id
         self.geolocation = geolocation
+        self.use_proxy = use_proxy
         self.amazon_cooldown = Cooldown(settings.amazon_min_delay, settings.amazon_max_delay, label="亚马逊")
         self.ml_cooldown = Cooldown(settings.ml_min_delay, settings.ml_max_delay, label="美客多")
         self._playwright: Any = None
@@ -167,12 +164,16 @@ class ArgentinaBrowser:
             accept_language=self.accept_language,
             timezone_id=self.timezone_id,
             geolocation=self.geolocation,
+            use_proxy=self.use_proxy,
         )
         Path(options["user_data_dir"]).mkdir(parents=True, exist_ok=True)
-        from seller_auto.proxy import ensure_local_proxy, proxy_label
+        if self.use_proxy:
+            from seller_auto.proxy import ensure_local_proxy, proxy_label
 
-        ensure_local_proxy()
-        log(f"出口代理 {proxy_label()}")
+            ensure_local_proxy()
+            log(f"出口代理 {proxy_label()}")
+        else:
+            log("直连，不走出口代理")
         playwright = sync_playwright().start()
         try:
             context = playwright.chromium.launch_persistent_context(**options)
@@ -437,59 +438,49 @@ class ArgentinaBrowser:
             return ""
 
     def _show_for_verification(self, page: Any) -> Any:
-        detail = page is self.detail_page and page is not self.list_page
-        urls = self._urls_to_restore(page, detail)
-        alive = context_is_alive(self.context) and _chrome_for_testing_running()
-        if not self.headless and alive:
+        if self._can_reuse_window():
             self._reveal_window(page)
-            if _chrome_for_testing_running() and self._activate_chrome():
-                return page
-            log("前台窗口已经不在，重新打开")
-        else:
-            log("需要手动验证，暂时打开前台窗口")
-        self._reopen(headless=False, urls=urls, restore_detail=detail)
+            log("需要手动验证，请在前台窗口里完成")
+            return page
+        log("需要手动验证，暂时打开前台窗口")
+        return self._reopen_foreground(page)
+
+    def _can_reuse_window(self) -> bool:
+        return (not self.headless) and context_is_alive(self.context)
+
+    def _browser_pid(self) -> int | None:
+        pids = _pids_for_profile(self.profile_dir)
+        if not pids:
+            return None
+        return min(pids)
+
+    def _reopen_foreground(self, page: Any) -> Any:
+        detail = page is self.detail_page and page is not self.list_page
+        self._reopen(headless=False, urls=self._urls_to_restore(page, detail), restore_detail=detail)
+        shown = self.detail_page if detail and self.detail_page is not None else self.list_page
         self._window_shown = True
-        self._activate_chrome()
-        return self.detail_page if detail and self.detail_page is not None else self.list_page
+        self._reveal_window(shown or page)
+        return shown or page
 
-    def _activate_chrome(self) -> bool:
-        """验证需要用户操作时，把 Chrome for Testing 调到前台。"""
-
-        if sys.platform != "darwin":
-            return True
+    def _bring_page_forward(self, page: Any) -> None:
+        target = self.live_page(page)
+        if target is None:
+            return
         try:
-            completed = subprocess.run(
-                [
-                    "osascript",
-                    "-e",
-                    'tell application "Google Chrome for Testing" to activate',
-                    "-e",
-                    'tell application "System Events" to set visible of process "Google Chrome for Testing" to true',
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return completed.returncode == 0
+            target.bring_to_front()
+        except Exception:
+            log("把验证页调到前台失败")
 
     def reveal(self, page: Any, reason: str) -> Any:
         """需要登录时把当前页放到前台。已经打开的浏览器只把窗口调出来。"""
 
-        if not self.headless:
+        if self._can_reuse_window():
             if self._window_shown is not True:
                 log(reason)
             self._reveal_window(page)
             return page
-        detail = page is self.detail_page and page is not self.list_page
-        urls = self._urls_to_restore(page, detail)
         log(reason)
-        self._reopen(headless=False, urls=urls, restore_detail=detail)
-        self._window_shown = True
-        shown = self.detail_page if detail and self.detail_page is not None else self.list_page
-        return shown or page
+        return self._reopen_foreground(page)
 
     def restore_background(self, page: Any) -> Any:
         if not self.background or self.headless:
@@ -513,11 +504,12 @@ class ArgentinaBrowser:
             from seller_auto.browser_launch import show_chrome_windows
 
             show_chrome_windows(self.profile_dir)
+            self._bring_page_forward(page)
             self._window_shown = True
             return
-        # 只保证窗口存在且可见，不 activate / bring_to_front，避免打断用户前台工作。
-        shown = _chrome_for_testing_visible(True)
+        shown = _chrome_for_testing_visible(True, self._browser_pid())
         placed = self._place_bounds(page, shown=True)
+        self._bring_page_forward(page)
         if shown or placed:
             self._window_shown = True
             return
@@ -532,7 +524,7 @@ class ArgentinaBrowser:
             hide_chrome_windows(self.profile_dir)
             self._window_shown = False
             return
-        if _chrome_for_testing_visible(False) or self._place_bounds(page, shown=False):
+        if _chrome_for_testing_visible(False, self._browser_pid()) or self._place_bounds(page, shown=False):
             self._window_shown = False
             return
         log("隐藏窗口失败，浏览器保持打开，没有重启")
